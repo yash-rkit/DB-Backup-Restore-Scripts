@@ -44,7 +44,7 @@ SERVER_NAME=""
 SECONDARY_STORAGE_DIR=""                             # set from --backup_base
 SMB_MOUNT_POINT="/livestorage"                       # MUST match backup.sh
 
-LOCAL_STAGE="/Data/dbvault-stage"                    # logs + staged binlogs only
+LOCAL_STAGE="/Data/dbvault-stage"                    # logs, staged binlogs, staged archive
 MYSQL_DATADIR="/Data/mysql"                          # ERASED by this script
 
 # Local logs and previews left behind when the share was unreachable are pruned
@@ -60,6 +60,35 @@ ARCHIVE_EXPANSION_FACTOR=5                           # fallback: x compressed si
 PARALLEL_THREADS=8                                   # xbstream and --decompress
 PREPARE_USE_MEMORY="1G"                              # empty = do not pass it
 
+# The archive is COPIED to local disk before the wipe, then extracted from
+# there. Two reasons, in order of importance:
+#   1. the network leaves the critical path. The wipe happens only once a
+#      verified local copy exists, so a share that drops costs a retry rather
+#      than a half-populated datadir.
+#   2. it is much faster. xbstream reads its stdin serially in small chunks and
+#      interleaves thousands of file creations; over SMB every one of those pays
+#      link latency. Measured on a 14GiB archive: 71 MiB/s for a flat read of
+#      the same file off the same share, 17 MiB/s for xbstream reading it.
+# Set to 0 to extract straight off the share (the old behaviour).
+STAGE_ARCHIVE=1
+ARCHIVE_STAGE_DIR="/Data/dbvault-stage"              # staged .xbstream lives here
+KEEP_STAGED_ON_FAILURE=1                             # 1 = a retry skips the copy
+
+# Fold the decompress into the extract: xbstream writes the datadir already
+# expanded, so the .zst files are never created and never read back. Saves a
+# 1x-compressed write plus a 1x-compressed read, and removes the leftover-.zst
+# hazard entirely rather than checking for it afterwards.
+# 0 until verified on this host: not every xtrabackup build has it, and a build
+# without zstd support fails the same way the two-pass path does.
+#   check with:  xbstream --help | grep -i decompress
+XBSTREAM_DECOMPRESS=0
+
+# The old value was a hardcoded 60 x 2s. A freshly restored multi-terabyte
+# datadir can spend well over two minutes opening tablespaces before it accepts
+# a connection, and the wait is cheap compared to redoing the restore.
+MYSQL_READY_TIMEOUT=900                              # seconds
+MYSQL_READY_INTERVAL=2
+
 BINLOG_PREFIX="binlog"                               # log_bin basename
 BINLOG_GLOB="${BINLOG_PREFIX}.[0-9][0-9][0-9][0-9][0-9][0-9]"
 BINLOG_FILE_START_POS=4                              # past the 4-byte magic
@@ -67,6 +96,7 @@ BINLOG_FILE_START_POS=4                              # past the 4-byte magic
 XTRABACKUP_BIN="/usr/bin/xtrabackup"
 XBSTREAM_BIN="/usr/bin/xbstream"
 MYSQL_BIN="/usr/bin/mysql"
+MYSQLADMIN_BIN="/usr/bin/mysqladmin"
 MYSQLBINLOG_BIN="/usr/bin/mysqlbinlog"
 MYSQL_SERVICE="mysql"
 
@@ -126,7 +156,7 @@ nok() { warn "$(leader "$1" "$2")"; }
 skp() { info "$(leader "$1" "$2")"; }
 
 CHECK_N=0
-CHECK_TOTAL=15
+CHECK_TOTAL=16
 PHASE_EPOCH=0
 
 phase() { PHASE="$1"; STEP="${2:--}"; PHASE_EPOCH="$(date +%s)"; }
@@ -155,6 +185,7 @@ START_EPOCH="$(date +%s)"
 BACKUP_ID=""
 SELF_CMD=""
 MYSQL_WAS_RUNNING=false
+RESTORE_COMPLETE=false   # MySQL is up on the restored datadir
 DATADIR_WIPED=false
 APPLY_STARTED=false
 APPLIED_COUNT=0
@@ -240,14 +271,39 @@ fail_run() {
     cerr "2. read the cause in ${ERROR_LOG:-the error log}"
     cerr "3. roll back and retry the whole thing:  $SELF_CMD"
     cerr "   (re-reads the full archive from the share — allow for the transfer)"
+  elif [[ "$RESTORE_COMPLETE" == true ]]; then
+    # The restore itself worked: the datadir holds the backup and mysqld is
+    # serving on it. Only the steps after that failed. Saying "the datadir was
+    # wiped" here — as this handler used to — sends the operator to redo 25
+    # minutes of work that is already done and intact.
+    erro "THE RESTORE COMPLETED — THE FAILURE IS AFTER IT"
+    cerr "$MYSQL_DATADIR holds the restored backup and MySQL is running on it."
+    cerr "no binlogs were applied, so the server sits at the backup anchor."
+    cerr ""
+    cerr "the restore does NOT need repeating. fix the cause, then apply the"
+    cerr "binlogs alone against the marker this run already wrote:"
+    cerr "  $SELF_CMD --binlog-only"
   elif [[ "$DATADIR_WIPED" == true ]]; then
     erro "THE DATADIR WAS ALREADY WIPED WHEN THIS FAILED"
-    cerr "$MYSQL_DATADIR is empty or partially restored, and MySQL is stopped."
-    cerr "it is NOT auto-started: mysqld on an incomplete or unprepared datadir"
-    cerr "rewrites pages on top of an inconsistent redo state."
+    # Observed, not assumed. This branch used to state "MySQL is stopped"
+    # unconditionally, which was false whenever the failure came after the
+    # start — and that is precisely when it misleads.
+    if mysql_up; then
+      cerr "$MYSQL_DATADIR is partially restored and mysqld IS RUNNING on it."
+      cerr "stop it before retrying:  systemctl stop $MYSQL_SERVICE"
+    else
+      cerr "$MYSQL_DATADIR is empty or partially restored, and MySQL is stopped."
+      cerr "it is NOT auto-started: mysqld on an incomplete or unprepared datadir"
+      cerr "rewrites pages on top of an inconsistent redo state."
+    fi
     cerr ""
-    cerr "the archive on the share is verified and intact — fix the cause and"
-    cerr "re-run the same command, which starts over from a clean wipe:"
+    if [[ -n "${STAGED_ARCHIVE:-}" && -f "${STAGED_ARCHIVE:-}" ]]; then
+      cerr "the verified archive is already staged on local disk — a re-run"
+      cerr "checksums it and skips the copy from the share:"
+    else
+      cerr "the archive on the share is verified and intact — fix the cause and"
+      cerr "re-run the same command, which starts over from a clean wipe:"
+    fi
     cerr "  $SELF_CMD"
   elif [[ "$MYSQL_WAS_RUNNING" == true ]] && ! mysql_up; then
     erro "MySQL is stopped, but the datadir was NOT touched"
@@ -255,6 +311,13 @@ fail_run() {
   else
     erro "nothing was modified"
     cerr "retry with:  $SELF_CMD"
+  fi
+
+  # The staged archive is KEPT by default: it is verified, and a retry that can
+  # skip the copy from the share turns a 25-minute redo into an 8-minute one.
+  if [[ "${KEEP_STAGED_ON_FAILURE:-1}" != "1" \
+        && -n "${STAGED_ARCHIVE:-}" && -f "${STAGED_ARCHIVE:-}" ]]; then
+    rm -f "$STAGED_ARCHIVE" 2>/dev/null || true
   fi
 
   [[ -n "${LOCAL_BINLOG_DIR:-}" && -d "$LOCAL_BINLOG_DIR" ]] \
@@ -283,8 +346,71 @@ trap fail_run ERR INT TERM
 # ═══════════════════════════════════════════════════════════════════════════
 
 free_gb()  { df -BG "$1" | awk 'NR==2 {print $4}' | sed 's/G//'; }
-mysql_q()  { "$MYSQL_BIN" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -NBe "$1" 2>/dev/null; }
-mysql_in() { "$MYSQL_BIN" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD"; }
+# `-p"$MYSQL_PASSWORD"` collapses to a bare `-p` when the password is empty,
+# which makes the client PROMPT instead of authenticating with an empty
+# password. The long form always carries an `=`, so it never prompts.
+# (The password is still visible in `ps` while a client runs — moving these to
+# a 0600 --defaults-extra-file is the proper fix, tracked separately.)
+mysql_q()  { "$MYSQL_BIN" --user="$MYSQL_USER" --password="$MYSQL_PASSWORD" -NBe "$1" 2>/dev/null; }
+mysql_in() { "$MYSQL_BIN" --user="$MYSQL_USER" --password="$MYSQL_PASSWORD"; }
+
+# Whether OUR credentials work, kept separate from whether the server is up.
+mysql_auth_ok() {
+  "$MYSQL_BIN" --user="$MYSQL_USER" --password="$MYSQL_PASSWORD" \
+    -NBe "SELECT 1" >/dev/null 2>>"${ERROR_LOG:-/dev/null}"
+}
+
+# Whether the server is answering, WITHOUT depending on credentials.
+#
+# This is the distinction the old readiness loop missed. A physical restore
+# replaces mysql.user with the SOURCE server's accounts, so this host's Admin
+# password can be rejected by a server that is up and perfectly healthy. The
+# old probe was `mysql ... -e 'SELECT 1' 2>/dev/null` — it discarded the error,
+# so ERROR 1045 (up, wrong password) and ERROR 2002 (not listening) were
+# indistinguishable, and both were reported as "did not accept connections".
+#
+# `Access denied` is proof the server is serving: it parsed our handshake to
+# reject it. MYSQL_PROBE_ERR carries the real client error for the caller.
+MYSQL_PROBE_ERR=""
+mysql_serving() {
+  MYSQL_PROBE_ERR="$("$MYSQLADMIN_BIN" --user="$MYSQL_USER" \
+                     --password="$MYSQL_PASSWORD" ping 2>&1)"
+  case "$MYSQL_PROBE_ERR" in
+    *"is alive"*)      return 0 ;;
+    *"Access denied"*) return 0 ;;
+    *1045*)            return 0 ;;
+  esac
+  return 1
+}
+
+# Where mysqld actually writes its errors. Asked of the config, not of the
+# server: the server is exactly what is unavailable when this is needed.
+mysql_error_log_path() {
+  local p
+  p="$(my_print_defaults mysqld 2>/dev/null \
+       | sed -n 's/^--log[-_]error=//p' | tail -1)"
+  [[ -n "$p" && -f "$p" ]] && { printf '%s\n' "$p"; return 0; }
+  for p in /var/log/mysql/error.log /var/log/mysqld.log /var/log/mysql/mysqld.log; do
+    [[ -f "$p" ]] && { printf '%s\n' "$p"; return 0; }
+  done
+  return 1
+}
+
+# The thing the operator had to go and find by hand. Printed into the run log at
+# the moment of failure, so the published log carries the cause with it.
+mysql_error_log_tail() {
+  local path n="${1:-25}"
+  if ! path="$(mysql_error_log_path)"; then
+    cerr "could not locate mysqld's error log (checked my_print_defaults and"
+    cerr "the usual paths) — find it with: my_print_defaults mysqld | grep log"
+    return 0
+  fi
+  cerr ""
+  cerr "last $n line(s) of $path:"
+  local l
+  while IFS= read -r l; do cerr "  $l"; done < <(tail -n "$n" "$path" 2>/dev/null)
+  return 0
+}
 
 mysql_up() {
   systemctl is-active --quiet "$MYSQL_SERVICE" 2>/dev/null && return 0
@@ -511,6 +637,11 @@ fi
 
 SMB_ARCHIVE="${SECONDARY_STORAGE_DIR}/${BACKUP_ID}.xbstream"
 CHECKSUM_FILE="${SECONDARY_STORAGE_DIR}/${BACKUP_ID}.sha256"
+
+# The local copy the restore actually reads. RESTORE_SOURCE is set in the verify
+# phase to whichever of the two the extract will consume.
+STAGED_ARCHIVE="${ARCHIVE_STAGE_DIR}/${BACKUP_ID}.xbstream"
+RESTORE_SOURCE="$SMB_ARCHIVE"
 MANIFEST_FILE="${SECONDARY_STORAGE_DIR}/${BACKUP_ID}.manifest"
 ANCHOR_FILE="${SECONDARY_STORAGE_DIR}/${BACKUP_ID}_binlog_info"
 SMB_BINLOG_DIR="${SECONDARY_STORAGE_DIR}/binlog/${BACKUP_ID}"
@@ -572,7 +703,7 @@ for cmd in awk sed find sort wc du df stat chown rm sleep basename sha256sum mou
   command -v "$cmd" >/dev/null 2>&1 \
     || die "$(leader 'required binaries' 'MISSING')" "not found in PATH: $cmd"
 done
-for bin in "$XTRABACKUP_BIN" "$XBSTREAM_BIN" "$MYSQL_BIN" "$MYSQLBINLOG_BIN"; do
+for bin in "$XTRABACKUP_BIN" "$XBSTREAM_BIN" "$MYSQL_BIN" "$MYSQLADMIN_BIN" "$MYSQLBINLOG_BIN"; do
   [[ -x "$bin" ]] || die "$(leader 'required binaries' 'MISSING')" "not executable: $bin"
 done
 ok "required binaries"
@@ -732,6 +863,60 @@ else
            "extract, decompress and prepare all happen in place in the datadir"
   val "datadir space" "need ${NEED_GB}GB / usable ${USABLE_GB}GB"
   cont "basis: $BASIS"
+fi
+
+# Staging adds a second claim on disk, and if it shares a filesystem with the
+# datadir the two compete for one budget. Getting this wrong means ENOSPC
+# *after* the wipe, which is the worst moment available — hence a check of its
+# own, before anything is touched.
+check
+if [[ $DO_RESTORE -eq 0 ]]; then
+  skp "archive staging space" "n/a (--binlog-only)"
+elif [[ $STAGE_ARCHIVE -ne 1 ]]; then
+  skp "archive staging space" "n/a (STAGE_ARCHIVE=0)"
+else
+  [[ -d "$ARCHIVE_STAGE_DIR" ]] \
+    || mkdir -p "$ARCHIVE_STAGE_DIR" 2>>"$ERROR_LOG" \
+    || die "$(leader 'archive staging space' 'NO STAGE DIR')" \
+           "cannot create $ARCHIVE_STAGE_DIR"
+
+  # Never inside the datadir: the wipe would delete the archive it is about to
+  # extract, mid-run, with the old data already gone.
+  case "$ARCHIVE_STAGE_DIR/" in
+    "$MYSQL_DATADIR"/*)
+      die "$(leader 'archive staging space' 'UNSAFE PATH')" \
+          "ARCHIVE_STAGE_DIR is inside the datadir and would be erased by the wipe" \
+          "stage: $ARCHIVE_STAGE_DIR" \
+          "datadir: $MYSQL_DATADIR" ;;
+  esac
+
+  # +10%: xbstream writes nothing here, but leave room for the run's logs.
+  STAGE_GB=$(( ARCHIVE_BYTES / 1073741824 * 110 / 100 + 2 ))
+
+  # Same device means one shared budget. stat -c %d is the device number, so
+  # this is true for bind mounts and subdirectories alike, unlike comparing paths.
+  STAGE_DEV="$(stat -c %d "$ARCHIVE_STAGE_DIR" 2>/dev/null || echo x)"
+  DATA_DEV="$(stat -c %d "$MYSQL_DATADIR"      2>/dev/null || echo y)"
+
+  if [[ "$STAGE_DEV" == "$DATA_DEV" ]]; then
+    COMBINED_GB=$(( ${NEED_GB:-0} + STAGE_GB ))
+    [[ ${USABLE_GB:-0} -ge $COMBINED_GB ]] \
+      || die "$(leader 'archive staging space' 'INSUFFICIENT')" \
+             "need ${COMBINED_GB}GB, usable ${USABLE_GB:-0}GB" \
+             "the stage and the datadir are on ONE filesystem, so the staged" \
+             "archive (${STAGE_GB}GB) and the expanded datadir (${NEED_GB:-0}GB) share it" \
+             "free space, stage elsewhere, or set STAGE_ARCHIVE=0"
+    val "archive staging space" "need ${COMBINED_GB}GB / usable ${USABLE_GB:-0}GB"
+    cont "shared filesystem: stage ${STAGE_GB}GB + datadir ${NEED_GB:-0}GB"
+  else
+    FREE_STAGE_GB=$(free_gb "$ARCHIVE_STAGE_DIR")
+    [[ $FREE_STAGE_GB -ge $STAGE_GB ]] \
+      || die "$(leader 'archive staging space' 'INSUFFICIENT')" \
+             "need ${STAGE_GB}GB, free ${FREE_STAGE_GB}GB in $ARCHIVE_STAGE_DIR" \
+             "free space, stage elsewhere, or set STAGE_ARCHIVE=0"
+    val "archive staging space" "need ${STAGE_GB}GB / free ${FREE_STAGE_GB}GB"
+    cont "separate filesystem from the datadir"
+  fi
 fi
 
 check
@@ -989,12 +1174,21 @@ fi
 #
 # Before MySQL is stopped and before anything is erased, so failing here is
 # free — the database is still running on its existing data.
+#
+# With STAGE_ARCHIVE=1 this phase also COPIES the archive to local disk and
+# checksums the copy. Everything that needs the network is therefore finished
+# before the wipe: the whole transfer moves out of the destructive window, and
+# the checksum certifies the exact bytes the extract will read rather than a
+# separate earlier read of the same path.
 # ═══════════════════════════════════════════════════════════════════════════
 
 phase verify 1/3
 if [[ $DO_RESTORE -eq 0 ]]; then
   skp "archive verification" "n/a (--binlog-only)"
-else
+elif [[ $STAGE_ARCHIVE -ne 1 ]]; then
+  # STAGE_ARCHIVE=0: verify on the share and extract from it. The archive is
+  # then read over the network TWICE — once here, once by xbstream — and the
+  # second read happens with the datadir already wiped.
   info "reading the whole archive off the share ($ARCHIVE_SIZE) — this takes a while"
   ACTUAL_SHA=$(sha256sum "$SMB_ARCHIVE" 2>>"$ERROR_LOG" | awk '{print $1}')
   [[ -n "$ACTUAL_SHA" ]] \
@@ -1008,14 +1202,76 @@ else
            "the datadir has NOT been touched — nothing is lost" \
            "restore from a different backup ID"
   ok "archive checksum"
+  RESTORE_SOURCE="$SMB_ARCHIVE"
+  info "verified in $(elapsed "$PHASE_EPOCH")"
+else
+  # Copy first, then checksum what landed. The checksum is taken from the LOCAL
+  # file, not the share, so it certifies the exact bytes the extract will read —
+  # the share version left a window where the two reads could disagree.
+  STAGED_REUSED=false
+  if [[ -f "$STAGED_ARCHIVE" ]]; then
+    STAGED_BYTES=$(stat -c %s "$STAGED_ARCHIVE" 2>/dev/null || echo 0)
+    if [[ "$STAGED_BYTES" == "$ARCHIVE_BYTES" ]]; then
+      info "a staged archive is already present — checksumming it instead of re-copying"
+      ACTUAL_SHA=$(sha256sum "$STAGED_ARCHIVE" 2>>"$ERROR_LOG" | awk '{print $1}')
+      if [[ "$ACTUAL_SHA" == "$EXPECTED_SHA" ]]; then
+        STAGED_REUSED=true
+        ok "staged archive reused"
+      else
+        nok "staged archive" "STALE — re-copying"
+      fi
+    else
+      nok "staged archive" "size mismatch — re-copying"
+    fi
+    [[ "$STAGED_REUSED" == true ]] || rm -f "$STAGED_ARCHIVE" 2>/dev/null || true
+  fi
+
+  if [[ "$STAGED_REUSED" != true ]]; then
+    info "copying the archive to local disk ($ARCHIVE_SIZE) — the network ends here"
+    set +e
+    cp "$SMB_ARCHIVE" "$STAGED_ARCHIVE" 2>>"$ERROR_LOG"
+    COPY_STATUS=$?
+    set -e
+    [[ $COPY_STATUS -eq 0 ]] \
+      || die "copying the archive from the share failed (cp exited $COPY_STATUS)" \
+             "the share may have dropped, or $ARCHIVE_STAGE_DIR is full" \
+             "the datadir has NOT been touched — nothing is lost"
+    STAGED_BYTES=$(stat -c %s "$STAGED_ARCHIVE" 2>/dev/null || echo 0)
+    [[ "$STAGED_BYTES" == "$ARCHIVE_BYTES" ]] \
+      || die "$(leader 'staged archive' 'SHORT')" \
+             "expected $ARCHIVE_BYTES bytes, got $STAGED_BYTES" \
+             "the copy was truncated — most likely the stage filesystem filled" \
+             "the datadir has NOT been touched — nothing is lost"
+    val "copied to local disk" "$(elapsed "$PHASE_EPOCH")"
+
+    info "checksumming the local copy"
+    ACTUAL_SHA=$(sha256sum "$STAGED_ARCHIVE" 2>>"$ERROR_LOG" | awk '{print $1}')
+    [[ -n "$ACTUAL_SHA" ]] \
+      || die "could not read the staged archive back to checksum it" \
+             "the datadir has NOT been touched — nothing is lost"
+    [[ "$ACTUAL_SHA" == "$EXPECTED_SHA" ]] \
+      || die "$(leader 'archive checksum' 'MISMATCH')" \
+             "expected $EXPECTED_SHA" \
+             "actual   $ACTUAL_SHA" \
+             "the copy on local disk does not match the manifest — the archive is" \
+             "corrupt on the share, or the transfer or local disk damaged it" \
+             "the datadir has NOT been touched — nothing is lost" \
+             "re-run to copy again, or restore from a different backup ID"
+    ok "archive checksum"
+  fi
+
+  RESTORE_SOURCE="$STAGED_ARCHIVE"
+  kv "restore source" "$STAGED_ARCHIVE (local)"
   info "verified in $(elapsed "$PHASE_EPOCH")"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 12  RESTORE  2/3
 #
-# Extract, decompress and prepare all happen IN PLACE in the datadir: no staging
-# copy and no --copy-back, so ~1x the data size rather than 2x. Everything from
+# Extract, decompress and prepare all happen IN PLACE in the datadir: no
+# --copy-back, so ~1x the data size there rather than 2x. With STAGE_ARCHIVE=1
+# the compressed archive is additionally held on local disk (see PART 11), which
+# the "archive staging space" pre-flight accounts for. Everything from
 # the stop onward is destructive.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1050,45 +1306,65 @@ else
     || die "the data directory is not empty after the wipe"
   ok "datadir cleared"
 
-  # The one window where a network problem is costly: the datadir is already
-  # wiped, so a stall here leaves it partially populated.
-  info "extracting the xbstream from the share (network in the critical path)"
-  "$XBSTREAM_BIN" -x --parallel="$PARALLEL_THREADS" -C "$MYSQL_DATADIR" \
-    < "$SMB_ARCHIVE" 2>>"$ERROR_LOG" \
+  # With STAGE_ARCHIVE=1 this reads from local disk, so the network is already
+  # out of the picture by here and the only exposure left is a local failure.
+  XBSTREAM_ARGS=(-x --parallel="$PARALLEL_THREADS" -C "$MYSQL_DATADIR")
+  if [[ $XBSTREAM_DECOMPRESS -eq 1 ]]; then
+    XBSTREAM_ARGS+=(--decompress --decompress-threads="$PARALLEL_THREADS")
+    EXTRACT_WHAT="extracting and decompressing the xbstream in one pass"
+  else
+    EXTRACT_WHAT="extracting the xbstream"
+  fi
+  if [[ "$RESTORE_SOURCE" == "$STAGED_ARCHIVE" ]]; then
+    info "$EXTRACT_WHAT from local disk"
+  else
+    info "$EXTRACT_WHAT from the share (network in the critical path)"
+  fi
+  "$XBSTREAM_BIN" "${XBSTREAM_ARGS[@]}" \
+    < "$RESTORE_SOURCE" 2>>"$ERROR_LOG" \
     || die "xbstream extraction failed" \
-           "if the share dropped, restore it and re-run the same command"
+           "$([[ $XBSTREAM_DECOMPRESS -eq 1 ]] \
+              && echo 'this build may not support --decompress: check xbstream --help' \
+              || echo 'if the share dropped, restore it and re-run the same command')"
   [[ -n "$(ls -A "$MYSQL_DATADIR" 2>/dev/null)" ]] \
     || die "the datadir is empty after extraction — the archive produced nothing"
   ok "extracted"
 
-  # --remove-original deletes each .zst as it expands, keeping peak usage just
-  # above the uncompressed size instead of holding both copies.
-  info "decompressing (zstd, --remove-original, $PARALLEL_THREADS threads)"
-  set +e
-  "$XTRABACKUP_BIN" --decompress --remove-original \
-    --parallel="$PARALLEL_THREADS" --target-dir="$MYSQL_DATADIR" \
-    >> "$XTRABACKUP_LOG" 2>&1
-  DECOMP_STATUS=$?
-  set -e
-  if [[ $DECOMP_STATUS -ne 0 ]]; then
-    erro "xtrabackup --decompress exited $DECOMP_STATUS"
-    cerr "last 40 lines of $XTRABACKUP_LOG:"
-    while IFS= read -r l; do cerr "  $l"; done < <(tail -40 "$XTRABACKUP_LOG" 2>/dev/null || true)
-    fail_run
+  # Skipped entirely when xbstream already expanded everything in the pass
+  # above: there is nothing compressed left on disk to walk.
+  if [[ $XBSTREAM_DECOMPRESS -eq 1 ]]; then
+    skp "decompressed" "n/a (folded into the extract)"
+  else
+    # --remove-original deletes each .zst as it expands, keeping peak usage just
+    # above the uncompressed size instead of holding both copies.
+    info "decompressing (zstd, --remove-original, $PARALLEL_THREADS threads)"
+    set +e
+    "$XTRABACKUP_BIN" --decompress --remove-original \
+      --parallel="$PARALLEL_THREADS" --target-dir="$MYSQL_DATADIR" \
+      >> "$XTRABACKUP_LOG" 2>&1
+    DECOMP_STATUS=$?
+    set -e
+    if [[ $DECOMP_STATUS -ne 0 ]]; then
+      erro "xtrabackup --decompress exited $DECOMP_STATUS"
+      cerr "last 40 lines of $XTRABACKUP_LOG:"
+      while IFS= read -r l; do cerr "  $l"; done < <(tail -40 "$XTRABACKUP_LOG" 2>/dev/null || true)
+      fail_run
+    fi
+    ok "decompressed"
   fi
 
-  # The real assertion: --prepare skips a leftover compressed file silently and
-  # it becomes an unreadable tablespace at runtime. `|| true` because find gets
-  # SIGPIPE from head, which pipefail would turn into a spurious failure.
+  # The real assertion, run either way: --prepare skips a leftover compressed
+  # file silently and it becomes an unreadable tablespace at runtime. `|| true`
+  # because find gets SIGPIPE from head, which pipefail would turn into a
+  # spurious failure.
   LEFTOVER=$(find "$MYSQL_DATADIR" -type f \( -name '*.zst' -o -name '*.qp' -o -name '*.lz4' \) 2>/dev/null | head -5 || true)
   if [[ -n "$LEFTOVER" ]]; then
-    erro "$(leader 'decompressed' 'FILES REMAIN')"
+    erro "$(leader 'compressed files' 'REMAIN')"
     while IFS= read -r f; do cerr "  $f"; done <<< "$LEFTOVER"
     cerr "this xtrabackup build may lack support for the compression used"
     cerr "compare the manifest's compression= against your xtrabackup version"
     fail_run
   fi
-  ok "decompressed"
 
   # The step the tar chain performed at BACKUP time.
   info "preparing (applying the redo log)${PREPARE_USE_MEMORY:+, --use-memory=$PREPARE_USE_MEMORY}"
@@ -1135,21 +1411,63 @@ else
 
   info "starting MySQL"
   systemctl start "$MYSQL_SERVICE" 2>>"$ERROR_LOG" \
-    || die "MySQL failed to start after the restore" \
-           "check the MySQL error log for details"
+    || { erro "MySQL failed to start after the restore"
+         cerr "systemctl start returned non-zero — mysqld never came up"
+         mysql_error_log_tail 30
+         fail_run; }
 
-  READY=false
-  for i in {1..60}; do
-    if mysql_q "SELECT 1" >/dev/null; then READY=true; break; fi
-    [[ $((i % 10)) -eq 0 ]] && info "still waiting for MySQL... (${i}/60)"
-    sleep 2
+  # ────────────────────────────────────────────────────────────────────────
+  # Readiness, kept strictly separate from authentication.
+  #
+  # The old loop was `mysql -e 'SELECT 1' 2>/dev/null` x60. It conflated three
+  # different states into one timeout message:
+  #   - mysqld not listening yet  (ERROR 2002)  -> keep waiting
+  #   - mysqld gone/crashed                     -> stop waiting NOW
+  #   - mysqld up, password rejected (1045)     -> it is READY; the credential
+  #                                                is the problem, not the server
+  # The third is not hypothetical here: a physical restore overwrites mysql.user
+  # with the SOURCE server's accounts, so this host's Admin password can be
+  # rejected by a server that restored perfectly.
+  # ────────────────────────────────────────────────────────────────────────
+  WAIT_START=$(date +%s)
+  WAIT_DEADLINE=$(( WAIT_START + MYSQL_READY_TIMEOUT ))
+  WAIT_NEXT_REPORT=$(( WAIT_START + 20 ))
+  while :; do
+    mysql_serving && break
+
+    # Fail fast instead of burning the whole timeout on a dead process. This is
+    # the difference between learning at 2s and learning at 15m.
+    if ! mysql_up; then
+      erro "mysqld exited while starting up"
+      cerr "systemd reported the unit started, but no mysqld process remains."
+      cerr "last client error: ${MYSQL_PROBE_ERR:-(none)}"
+      mysql_error_log_tail 40
+      fail_run
+    fi
+
+    NOW=$(date +%s)
+    if [[ $NOW -ge $WAIT_DEADLINE ]]; then
+      erro "MySQL did not answer within ${MYSQL_READY_TIMEOUT}s"
+      cerr "mysqld IS running, but it never began serving connections."
+      cerr "last client error: ${MYSQL_PROBE_ERR:-(none)}"
+      cerr ""
+      cerr "a large datadir can spend a long time opening tablespaces — if the"
+      cerr "error log below shows it still working, raise MYSQL_READY_TIMEOUT"
+      cerr "(currently ${MYSQL_READY_TIMEOUT}s) rather than re-running the restore."
+      mysql_error_log_tail 40
+      fail_run
+    fi
+    if [[ $NOW -ge $WAIT_NEXT_REPORT ]]; then
+      info "still waiting for MySQL... ($(( NOW - WAIT_START ))s of ${MYSQL_READY_TIMEOUT}s)"
+      WAIT_NEXT_REPORT=$(( NOW + 20 ))
+    fi
+    sleep "$MYSQL_READY_INTERVAL"
   done
-  [[ "$READY" == true ]] \
-    || die "MySQL did not accept connections within 120s" "check the MySQL error log"
-  ok "mysql accepting connections"
+  ok "mysql serving"
 
   # A live, consistent database from here: later failures are apply failures.
   DATADIR_WIPED=false
+  RESTORE_COMPLETE=true
 
   # A safety mechanism, not bookkeeping: --binlog-only reads binlogs_applied
   # from this to refuse a second apply.
@@ -1170,6 +1488,30 @@ recovery_method=file_position
 binlogs_applied=no
 EOF
   ok "restore marker written"
+
+  # Only NOW is it worth asking whether our credentials still work. The marker
+  # is already on disk, so if this fails the operator fixes the password and
+  # runs --binlog-only rather than repeating the whole restore.
+  #
+  # This is a real failure — the apply needs a working connection — but it is a
+  # completely different one from "MySQL did not start", and it used to be
+  # reported as the latter.
+  if ! mysql_auth_ok; then
+    erro "$(leader 'credentials' 'REJECTED')"
+    cerr "mysqld is up and serving, but '$MYSQL_USER' cannot log in."
+    cerr "client error: ${MYSQL_PROBE_ERR:-see $ERROR_LOG}"
+    cerr ""
+    cerr "expected after a physical restore: the datadir carries the SOURCE"
+    cerr "server's mysql.user table, so this host's password for '$MYSQL_USER'"
+    cerr "is no longer the one that applies. The restored DATA is fine."
+    cerr ""
+    cerr "recover the account, then apply the binlogs alone:"
+    cerr "  systemctl stop $MYSQL_SERVICE"
+    cerr "  # start with --skip-grant-tables, reset the password, restart"
+    cerr "  $SELF_CMD --binlog-only"
+    fail_run
+  fi
+  ok "credentials accepted"
 
   DB_COUNT=$(mysql_q "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','mysql','performance_schema','sys')" || echo 0)
   info "restored in $(elapsed "$PHASE_EPOCH")  —  $DB_COUNT user database(s)"
@@ -1314,6 +1656,15 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 
 PHASE="done"; STEP="-"
+
+# The run succeeded, so the staged archive has served its purpose. Left behind
+# it would silently hold 14-30GB per server until someone noticed.
+if [[ $STAGE_ARCHIVE -eq 1 && -f "$STAGED_ARCHIVE" ]]; then
+  STAGED_FREED="$(hsize "$(stat -c %s "$STAGED_ARCHIVE" 2>/dev/null || echo 0)")"
+  rm -f "$STAGED_ARCHIVE" 2>/dev/null \
+    && info "removed the staged archive ($STAGED_FREED reclaimed)" \
+    || warn "could not remove $STAGED_ARCHIVE — $STAGED_FREED still in use"
+fi
 
 emit ""
 banner " RESTORE OK  $SERVER_NAME  $BACKUP_ID"

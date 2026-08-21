@@ -341,22 +341,125 @@ restore_vm.sh --server_name=NAME --backup_base=PATH
 ```
 
 The same three phases as [`restore.sh`](./restore.sh) — verify, restore
-(wipe → extract → decompress → prepare → start), apply — with the same 14
-substantive checks, the same one-shot binlog apply, the same
-state-selected failure advice, and one addition: the source server is an
-argument. Read [README.md](./README.md) §9 for the phase logic; only the
-differences are below.
+(**copy → wipe → extract → decompress → prepare → start**), apply — with the
+same one-shot binlog apply, the same state-selected failure advice, and one
+addition: the source server is an argument. Read [README.md](./README.md) §9 for
+the phase logic; only the differences are below.
 
 | `restore.sh`                                | `restore_vm.sh`                                   |
 | ------------------------------------------- | ------------------------------------------------- |
 | `SECONDARY_STORAGE_DIR` is a constant       | `--backup_base`, validated to be under the mount  |
 | backup id is a positional argument          | `--backup_id`, or the latest archive of `--backup_date` (default today) |
 | marker `${BACKUP_ID}_restore_state`          | marker `${SERVER_NAME}_${BACKUP_ID}_restore_state` |
-| 14 pre-flight checks                        | 15 — the extra one is `backup base` under the mount |
+| 14 pre-flight checks                        | 16 — `backup base` under the mount, and `archive staging space` |
+| extracts straight off the share             | copies the archive to local disk first (`STAGE_ARCHIVE=1`) |
 | next step: take a fresh backup              | next step: `logical.sh` — this datadir is temporary |
 
 `restore.sh` is unchanged and stays the tool for restoring a server onto itself.
 
+### Staging the archive on local disk
+
+`STAGE_ARCHIVE=1` (the default) copies the `.xbstream` from the share to
+`ARCHIVE_STAGE_DIR` **before** MySQL is stopped, checksums the local copy, and
+extracts from there. Set it to `0` to get the old behaviour of extracting
+straight off the share.
+
+Two reasons, in order of importance:
+
+**The network leaves the destructive window.** The wipe happens only once a
+verified local copy exists, so a share that drops costs a retry instead of
+leaving a half-populated datadir with the old data already gone.
+
+**It is much faster.** `xbstream` reads its stdin serially in small chunks and
+interleaves thousands of file creations; over SMB every one of those pays link
+latency. Measured on the same 14GiB archive, same share, same run:
+
+| | over the network | throughput |
+| --- | --- | --- |
+| flat read (`sha256sum` of the archive) | 14 GiB | 71 MiB/s |
+| `xbstream -x` reading the same file    | 14 GiB | 17 MiB/s |
+
+The old flow paid that second, slower read *and* read the archive twice —
+once to verify, once to extract. Staging reads it once, at the faster rate.
+
+Checksumming the local copy is also a stronger guarantee than checksumming the
+share: it certifies the exact bytes the extract will consume, where the old
+order left a window in which the two separate reads could disagree.
+
+On success the staged file is deleted. On failure it is **kept**
+(`KEEP_STAGED_ON_FAILURE=1`) — it is already verified, so a re-run checksums it
+and skips the copy, turning a ~25-minute redo into roughly 8 minutes.
+
+`archive staging space` is a pre-flight check of its own because the stage and
+the datadir may share a filesystem, in which case they compete for one budget.
+It compares `stat -c %d` on both paths and sizes the requirement accordingly.
+Getting this wrong means ENOSPC *after* the wipe.
+
+### One-pass extract (`XBSTREAM_DECOMPRESS`)
+
+Off by default. When set to `1`, `xbstream -x --decompress` writes the datadir
+already expanded, so the `.zst` files are never created and never read back —
+saving a 1x-compressed write plus a 1x-compressed read (~2 minutes on a 14GiB
+archive, since the 94GiB write dominates either way and that write remains).
+
+The real gain is not speed. The two-pass flow has a silent-corruption path:
+`--prepare` skips a leftover compressed file without complaint and it becomes an
+unreadable tablespace at runtime. The script guards it with a `find` for
+`*.zst *.qp *.lz4`, but one-pass extraction removes the intermediate compressed
+state altogether, so there is nothing to leave behind.
+
+Verify support before enabling — not every build has it:
+
+```bash
+xbstream --help | grep -i decompress
+```
+
+### Waiting for MySQL after the restore
+
+Readiness and authentication are checked **separately**, and this matters more
+than it sounds.
+
+A physical restore overwrites `mysql.user` with the **source** server's
+accounts. After restoring server A onto host B, `MYSQL_USER`'s password is
+whatever it is on A — so a credential-based readiness probe can be rejected by a
+server that restored perfectly and is serving normally.
+
+The probe is therefore `mysqladmin ping`, and an `Access denied` reply counts as
+**up**: the server parsed the handshake in order to refuse it. Three states are
+now distinguished where the old loop reported all of them as
+`MySQL did not accept connections within 120s`:
+
+| state | client error | what happens |
+| --- | --- | --- |
+| still starting | 2002 / 2003 | keep waiting, up to `MYSQL_READY_TIMEOUT` |
+| process gone | any, and `mysql_up` false | **fail immediately**, with the mysqld error log |
+| up, password rejected | 1045 | readiness passes; the credential is reported separately |
+
+Three related settings and behaviours:
+
+- `MYSQL_READY_TIMEOUT` (default `900`) replaces a hardcoded 60 × 2s. A large
+  datadir can spend well over two minutes opening tablespaces, and waiting is
+  far cheaper than repeating the restore.
+- A dead mysqld is detected on the next poll rather than at the timeout, so a
+  genuine startup failure surfaces in seconds instead of minutes.
+- Every failure here prints the tail of **mysqld's own error log** into the run
+  log, located from `my_print_defaults` rather than from the server. The old
+  message said "check the MySQL error log" without saying where it was.
+
+If the credentials are rejected, the restore is already complete and the marker
+is already written, so recovery does not repeat it:
+
+```bash
+systemctl stop mysql
+# start with --skip-grant-tables, reset the account, restart
+restore_vm.sh --server_name=NAME --backup_base=PATH --binlog-only
+```
+
+`fail_run` reports this accurately. Its `DATADIR_WIPED` branch used to state
+"MySQL is stopped" as fixed text, which was false whenever the failure came
+*after* the start — precisely when it misleads. It now observes `mysql_up`, and
+a failure after a completed restore says so instead of sending the operator to
+redo work that is intact.
 ### Resolving "today's latest"
 
 With no `--backup_id`, the id is the newest archive whose name starts with the
