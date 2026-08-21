@@ -373,8 +373,10 @@ mysql_auth_ok() {
 # reject it. MYSQL_PROBE_ERR carries the real client error for the caller.
 MYSQL_PROBE_ERR=""
 mysql_serving() {
+  # Flattened to one line: this text is printed through cerr, which pads a
+  # single leader, so an embedded newline would break the log alignment.
   MYSQL_PROBE_ERR="$("$MYSQLADMIN_BIN" --user="$MYSQL_USER" \
-                     --password="$MYSQL_PASSWORD" ping 2>&1)"
+                     --password="$MYSQL_PASSWORD" ping 2>&1 | tr "\n" " ")"
   case "$MYSQL_PROBE_ERR" in
     *"is alive"*)      return 0 ;;
     *"Access denied"*) return 0 ;;
@@ -1261,7 +1263,7 @@ else
   fi
 
   RESTORE_SOURCE="$STAGED_ARCHIVE"
-  kv "restore source" "$STAGED_ARCHIVE (local)"
+  val "restore source" "local stage"
   info "verified in $(elapsed "$PHASE_EPOCH")"
 fi
 
