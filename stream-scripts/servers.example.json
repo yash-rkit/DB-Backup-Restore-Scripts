@@ -1,0 +1,50 @@
+[
+  {
+    "server_name": "Cloud-Live-DB-Every-Key",
+    "backup_base": "/livestorage/Backup/Cloud-Live-DB-Every-Key",
+    "base_dir":    "/livestorage/Logical/Cloud-Live-DB-Every-Key",
+    "backup_id":   "20260820_143005",
+    "skip_binlog": true,
+    "mysql_host":  "127.0.0.1",
+    "mode":        "SELECTED",
+    "db_list_dir": "/Data/script/dblist",
+    "sync_dest":   "/southstorage/backup_latest/Cloud-Live-DB-Every-Key",
+    "retention":   "days:30"
+  },
+  {
+    "server_name": "Cloud-Live-DB-Default",
+    "backup_base": "/livestorage/Backup/Cloud-Live-DB-Default",
+    "base_dir":    "/livestorage/Logical/Cloud-Live-DB-Default",
+    "sync_dest":   "/southstorage/backup_latest/Cloud-Live-DB-Default",
+    "retention":   "smart"
+  },
+  {
+    "server_name": "Cloud-Live-DB-4th-Server",
+    "backup_base": "/livestorage/Backup/Cloud-Live-DB-4th-Server",
+    "base_dir":    "/livestorage/Logical/Cloud-Live-DB-4th-Server",
+    "sync_dest":   "/southstorage/backup_latest/Cloud-Live-DB-4th-Server",
+    "retention":   "days:15"
+  },
+  {
+    "server_name": "Cloud-Live-DB-Sandbox",
+    "backup_base": "/livestorage/Backup/Cloud-Live-DB-Sandbox",
+    "base_dir":    "/livestorage/Logical/Cloud-Live-DB-Sandbox",
+    "sync_dest":   "/southstorage/backup_latest/Cloud-Live-DB-Sandbox",
+    "retention":   "days:7",
+    "skip_binlog": true
+  },
+  {
+    "server_name": "Cloud-Live-DB-Tirupati",
+    "backup_base": "/livestorage/Backup/Cloud-Live-DB-Tirupati",
+    "base_dir":    "/livestorage/Logical/Cloud-Live-DB-Tirupati",
+    "sync_dest":   "/southstorage/backup_latest/Cloud-Live-DB-Tirupati",
+    "retention":   "days:15"
+  },
+  {
+    "server_name": "GSP-Cloud-Live-DB",
+    "backup_base": "/livestorage/Backup/GSP-Cloud-Live-DB",
+    "base_dir":    "/livestorage/Logical/GSP-Cloud-Live-DB",
+    "sync_dest":   "/southstorage/backup_latest/GSP-Cloud-Live-DB",
+    "retention":   "smart"
+  }
+]
