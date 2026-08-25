@@ -156,6 +156,7 @@ OK_SERVERS=()
 FAILED_SERVERS=()
 SYNC_TARGETS=0
 RET_TARGETS=0
+PHYS_RET_TARGETS=0
 SYNC_STATE="not run"
 CLEANUP_STATE="not run"
 CURRENT=""
@@ -211,6 +212,15 @@ prune_local() {
   return 0
 }
 
+# What actually broke. A die() names its own cause; an uncaught non-zero does
+# not, and used to produce a failure banner with no reason in it at all. These
+# carry what bash knows about that case: the command, its line, its exit code.
+DIED=0
+INTERRUPTED=0
+FAILED_CMD=""
+FAILED_LINE=""
+FAILED_RC=""
+
 fail_run() {
   trap - ERR INT TERM
   local at="$PHASE $STEP"
@@ -218,6 +228,13 @@ fail_run() {
   emit ""
   banner " PIPELINE FAILED"
   kv "failed in" "$at"
+  if [[ ${INTERRUPTED:-0} -eq 1 ]]; then
+    kv "cause" "interrupted — Ctrl-C or kill"
+  elif [[ ${DIED:-0} -eq 0 && -n "${FAILED_CMD:-}" ]]; then
+    kv "cause"          "uncaught failure — no check reported this"
+    kv "failed command" "$FAILED_CMD"
+    kv "at line"        "${FAILED_LINE:-?}  (exit ${FAILED_RC:-?})"
+  fi
   kv "duration"  "$(elapsed "$START_EPOCH")"
   [[ -n "$CURRENT" ]] && kv "working on" "$CURRENT"
   sub
@@ -246,12 +263,23 @@ fail_run() {
 }
 
 die() {
+  DIED=1
   erro "$1"; shift
   local l; for l in "$@"; do cerr "$l"; done
   fail_run
 }
 
-trap fail_run ERR INT TERM
+# Captured inside the trap, not in fail_run: fail_run's own commands overwrite
+# BASH_COMMAND, so by the time it runs the failing command is already gone.
+on_err() {
+  FAILED_RC=$?
+  FAILED_CMD="$BASH_COMMAND"
+  FAILED_LINE="${BASH_LINENO[0]}"
+  fail_run
+}
+
+trap on_err ERR
+trap 'INTERRUPTED=1; fail_run' INT TERM
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 4  PROBES
@@ -381,9 +409,9 @@ fi
 # A dry run never erases a datadir, so it never needs the VM to stop either.
 [[ $DRY_RUN -eq 1 ]] && NO_SHUTDOWN=1
 
-MODE="full pipeline"
-[[ $SKIP_BINLOG -eq 1 ]] && MODE="$MODE, backup point only"
-[[ $DRY_RUN     -eq 1 ]] && MODE="DRY RUN — verify only, nothing modified"
+RUN_MODE="full pipeline"
+[[ $SKIP_BINLOG -eq 1 ]] && RUN_MODE="$RUN_MODE, backup point only"
+[[ $DRY_RUN     -eq 1 ]] && RUN_MODE="DRY RUN — verify only, nothing modified"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 6  SINGLE-INSTANCE LOCK
@@ -419,7 +447,7 @@ printf 'errors for pipeline run %s\n\n' "$RUN_STAMP" > "$ERROR_LOG"
 banner " PIPELINE RUN  $RUN_STAMP"
 kv "started"     "$(date '+%F %T %Z')"
 kv "host"        "$(hostname -s 2>/dev/null || echo unknown)"
-kv "mode"        "$MODE"
+kv "mode"        "$RUN_MODE"
 kv "config"      "$CONFIG_FILE"
 kv "backup date" "${BACKUP_DATE:-today ($(date +%Y%m%d))}"
 kv "restore"     "$RESTORE_SCRIPT"
@@ -502,13 +530,13 @@ val "config parses" "$SERVER_COUNT server(s)"
 # Read once into arrays: the loop in PART 9 never touches the file again, so a
 # config edited mid-run cannot change what this run does.
 check
-NAMES=();  BASES=(); DUMPS=(); IDS=(); SKIPS=(); HOSTS=(); MODES=(); LISTS=()
+SERVER_NAMES=();  BASES=(); DUMPS=(); IDS=(); SKIPS=(); HOSTS=(); MODES=(); LISTS=()
 PROBLEMS=0
 for i in $(seq 0 $((SERVER_COUNT - 1))); do
   n="$(jqv ".[$i].server_name // empty")"
   b="$(jqv ".[$i].backup_base // empty")"
   d="$(jqv ".[$i].base_dir // empty")"
-  NAMES+=("$n"); BASES+=("$b"); DUMPS+=("$d")
+  SERVER_NAMES+=("$n"); BASES+=("$b"); DUMPS+=("$d")
   IDS+=("$(jqv ".[$i].backup_id // empty")")
   SKIPS+=("$(jqv ".[$i].skip_binlog // empty")")
   HOSTS+=("$(jqv ".[$i].mysql_host // empty")")
@@ -544,11 +572,11 @@ for i in $(seq 0 $((SERVER_COUNT - 1))); do
     PROBLEMS=$((PROBLEMS + 1))
   fi
 
-  # Fields this script only passes through: backup_sync.sh reads sync_dest and
-  # db_cleanup.sh reads retention, from this same file. Both are OPTIONAL and
-  # both are opt-in — an entry without the key is not synced, or not expired.
-  # They are validated here anyway, so a typo surfaces in pre-flight rather than
-  # three hours later, in the step that consumes it.
+  # Fields this script only passes through: backup_sync.sh reads sync_dest, and
+  # db_cleanup.sh reads retention and physical_retention, from this same file.
+  # All three are OPTIONAL and opt-in — an entry without the key is not synced,
+  # or not expired. They are validated here anyway, so a typo surfaces in
+  # pre-flight rather than three hours later, in the step that consumes it.
   dst="$(jqv ".[$i].sync_dest // empty")"
   if [[ -n "$dst" ]]; then
     SYNC_TARGETS=$((SYNC_TARGETS + 1))
@@ -572,14 +600,30 @@ for i in $(seq 0 $((SERVER_COUNT - 1))); do
          PROBLEMS=$((PROBLEMS + 1)) ;;
     esac
   fi
+  # Same patterns, but over backup_base: this expires the .xbstream sets, and a
+  # set is seven files and directories that only mean anything together.
+  pret="$(jqv ".[$i].physical_retention // empty")"
+  if [[ -n "$pret" ]]; then
+    PHYS_RET_TARGETS=$((PHYS_RET_TARGETS + 1))
+    case "$pret" in
+      smart) ;;
+      days:*) [[ "${pret#days:}" =~ ^[1-9][0-9]*$ ]] || {
+                erro "$(leader "$label" 'BAD PHYSICAL RETENTION')"
+                cerr "'$pret' — days:N needs N as a positive integer"
+                PROBLEMS=$((PROBLEMS + 1)); } ;;
+      *) erro "$(leader "$label" 'BAD PHYSICAL RETENTION')"
+         cerr "'$pret' — expected 'smart' or 'days:N'"
+         PROBLEMS=$((PROBLEMS + 1)) ;;
+    esac
+  fi
 done
 
 # One name restored twice in a night would leave the second run's dumps under
 # the same tree with no way to tell which restore produced which archive.
-DUPES="$(printf '%s\n' "${NAMES[@]}" | sort | uniq -d || true)"
-if [[ -n "$DUPES" ]]; then
+DUPLICATE_NAMES="$(printf '%s\n' "${SERVER_NAMES[@]}" | sort | uniq -d || true)"
+if [[ -n "$DUPLICATE_NAMES" ]]; then
   erro "$(leader 'config entries' 'DUPLICATE SERVER NAME')"
-  while IFS= read -r d; do cerr "  $d"; done <<< "$DUPES"
+  while IFS= read -r d; do cerr "  $d"; done <<< "$DUPLICATE_NAMES"
   PROBLEMS=$((PROBLEMS + 1))
 fi
 
@@ -603,6 +647,11 @@ if [[ $RET_TARGETS -eq 0 ]]; then
 else
   val "retention rules" "$RET_TARGETS/$SERVER_COUNT entries have retention"
 fi
+if [[ $PHYS_RET_TARGETS -eq 0 ]]; then
+  cont "no entry has physical_retention — no .xbstream set is ever expired"
+else
+  val "physical rules" "$PHYS_RET_TARGETS/$SERVER_COUNT entries have physical_retention"
+fi
 
 check
 mountpoint -q "$SMB_MOUNT_POINT" \
@@ -616,7 +665,7 @@ check
 MISSING_BASES=0
 for i in $(seq 0 $((SERVER_COUNT - 1))); do
   if [[ ! -d "${BASES[$i]}" ]]; then
-    nok "${NAMES[$i]}" "NO BACKUP DIRECTORY"
+    nok "${SERVER_NAMES[$i]}" "NO BACKUP DIRECTORY"
     cont "expected ${BASES[$i]}"
     MISSING_BASES=$((MISSING_BASES + 1))
   fi
@@ -682,7 +731,7 @@ phase servers 1/3
 SERVERS_EPOCH="$PHASE_EPOCH"
 
 for i in $(seq 0 $((SERVER_COUNT - 1))); do
-  name="${NAMES[$i]}"
+  name="${SERVER_NAMES[$i]}"
   CURRENT="$name ($((i + 1))/$SERVER_COUNT)"
 
   sub
@@ -851,7 +900,7 @@ else
   banner " PIPELINE INCOMPLETE  $RUN_STAMP"
 fi
 kv "duration"  "$(elapsed "$START_EPOCH")"
-kv "mode"      "$MODE"
+kv "mode"      "$RUN_MODE"
 kv "servers"   "$SERVER_COUNT configured, ${#OK_SERVERS[@]} succeeded, ${#FAILED_SERVERS[@]} failed"
 kv "succeeded" "${OK_SERVERS[*]:-none}"
 kv "failed"    "${FAILED_SERVERS[*]:-none}"

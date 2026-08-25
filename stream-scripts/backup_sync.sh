@@ -148,14 +148,14 @@ COPIED_BYTES=0
 DELETED=0
 FREED_BYTES=0
 PRUNED_LOGS=0
-PAIRS=0
+COPY_PAIR_COUNT=0
 MISSING_SERVERS=0
 EMPTY_DBS=0
 PUBLISHED_LOGS=0
 CURRENT=""
-NAMES=()
-SRCS=()
-DSTS=()
+SERVER_NAMES=()
+SOURCE_DIRS=()
+DEST_DIRS=()
 
 publish_logs() {
   [[ "$PUBLISHED_LOGS" == "1" ]] && return 0
@@ -208,6 +208,15 @@ prune_local() {
   return 0
 }
 
+# What actually broke. A die() names its own cause; an uncaught non-zero does
+# not, and used to produce a failure banner with no reason in it at all. These
+# carry what bash knows about that case: the command, its line, its exit code.
+DIED=0
+INTERRUPTED=0
+FAILED_CMD=""
+FAILED_LINE=""
+FAILED_RC=""
+
 fail_run() {
   trap - ERR INT TERM
   local at="$PHASE $STEP"
@@ -215,6 +224,13 @@ fail_run() {
   emit ""
   banner " BACKUP SYNC FAILED"
   kv "failed in" "$at"
+  if [[ ${INTERRUPTED:-0} -eq 1 ]]; then
+    kv "cause" "interrupted — Ctrl-C or kill"
+  elif [[ ${DIED:-0} -eq 0 && -n "${FAILED_CMD:-}" ]]; then
+    kv "cause"          "uncaught failure — no check reported this"
+    kv "failed command" "$FAILED_CMD"
+    kv "at line"        "${FAILED_LINE:-?}  (exit ${FAILED_RC:-?})"
+  fi
   kv "duration"  "$(elapsed "$START_EPOCH")"
   [[ -n "$CURRENT" ]] && kv "working on" "$CURRENT"
   sub
@@ -225,8 +241,8 @@ fail_run() {
   # this run actually resolved. A .part is invisible to every consumer, but it
   # would also be permanent — no later run knows it is there.
   local d f n=0
-  if [[ ${#DSTS[@]} -gt 0 ]] && mountpoint -q "$DEST_MOUNT_POINT" 2>/dev/null; then
-    for d in "${DSTS[@]}"; do
+  if [[ ${#DEST_DIRS[@]} -gt 0 ]] && mountpoint -q "$DEST_MOUNT_POINT" 2>/dev/null; then
+    for d in "${DEST_DIRS[@]}"; do
       [[ -n "$d" && -d "$d" ]] || continue
       while IFS= read -r f; do
         rm -f "$f" 2>/dev/null && n=$((n + 1))
@@ -249,12 +265,23 @@ fail_run() {
 }
 
 die() {
+  DIED=1
   erro "$1"; shift
   local l; for l in "$@"; do cerr "$l"; done
   fail_run
 }
 
-trap fail_run ERR INT TERM
+# Captured inside the trap, not in fail_run: fail_run's own commands overwrite
+# BASH_COMMAND, so by the time it runs the failing command is already gone.
+on_err() {
+  FAILED_RC=$?
+  FAILED_CMD="$BASH_COMMAND"
+  FAILED_LINE="${BASH_LINENO[0]}"
+  fail_run
+}
+
+trap on_err ERR
+trap 'INTERRUPTED=1; fail_run' INT TERM
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 4  PROBES
@@ -454,14 +481,14 @@ for i in $(seq 0 $((SERVER_COUNT - 1))); do
     PROBLEMS=$((PROBLEMS + 1))
   fi
 
-  NAMES+=("$n"); SRCS+=("$s"); DSTS+=("$d")
+  SERVER_NAMES+=("$n"); SOURCE_DIRS+=("$s"); DEST_DIRS+=("$d")
 done
 
 [[ $PROBLEMS -eq 0 ]] \
   || die "$(leader 'config parses' "$PROBLEMS PROBLEM(S)")" \
          "listed above; nothing has been copied or deleted"
 
-SYNC_COUNT=${#NAMES[@]}
+SYNC_COUNT=${#SERVER_NAMES[@]}
 val "config parses" "$SERVER_COUNT entry/ies, $SYNC_COUNT with sync_dest"
 [[ -n "$NOT_CONFIGURED" ]] && cont "no sync_dest, not copied: $NOT_CONFIGURED"
 
@@ -501,12 +528,12 @@ mountpoint -q "$DEST_MOUNT_POINT" \
 if [[ $DRY_RUN -eq 1 ]]; then
   skp "destination share" "mounted (not writing, dry run)"
 else
-  for i in $(seq 0 $((${#DSTS[@]} - 1))); do
-    mkdir -p "${DSTS[$i]}" 2>/dev/null \
-      || die "$(leader 'destination share' 'MKDIR FAILED')" "${DSTS[$i]}"
-    writable "${DSTS[$i]}" \
+  for i in $(seq 0 $((${#DEST_DIRS[@]} - 1))); do
+    mkdir -p "${DEST_DIRS[$i]}" 2>/dev/null \
+      || die "$(leader 'destination share' 'MKDIR FAILED')" "${DEST_DIRS[$i]}"
+    writable "${DEST_DIRS[$i]}" \
       || die "$(leader 'destination share' 'NOT WRITABLE')" \
-             "mounted but not writable: ${DSTS[$i]}" \
+             "mounted but not writable: ${DEST_DIRS[$i]}" \
              "stale handle, auth failure, or uid=/gid=/file_mode= mount options"
   done
   ok "destination share"
@@ -529,24 +556,24 @@ check
 if [[ $DRY_RUN -eq 1 ]]; then
   skp "sha256 utility" "not tested (dry run)"
 else
-  PROBE="${DSTS[0]}/.sha256_probe_$$"
-  echo probe > "$PROBE" 2>/dev/null \
-    || die "$(leader 'sha256 utility' 'WRITE FAILED')" "cannot write to ${DSTS[0]}"
-  sha256sum "$PROBE" >/dev/null 2>&1 \
-    || { rm -f "$PROBE"; die "$(leader 'sha256 utility' 'FAILED')" \
+  PROBE_FILE="${DEST_DIRS[0]}/.sha256_probe_$$"
+  echo probe > "$PROBE_FILE" 2>/dev/null \
+    || die "$(leader 'sha256 utility' 'WRITE FAILED')" "cannot write to ${DEST_DIRS[0]}"
+  sha256sum "$PROBE_FILE" >/dev/null 2>&1 \
+    || { rm -f "$PROBE_FILE"; die "$(leader 'sha256 utility' 'FAILED')" \
            "sha256sum cannot hash a file on $DEST_MOUNT_POINT"; }
-  rm -f "$PROBE"
+  rm -f "$PROBE_FILE"
   ok "sha256 utility"
 fi
 
 check
-STALE=0
-for i in $(seq 0 $((${#DSTS[@]} - 1))); do
-  [[ -d "${DSTS[$i]}" ]] || continue
-  STALE=$(( STALE + $(find "${DSTS[$i]}" -type f -name '*.tar.gz.part' 2>/dev/null | wc -l) ))
+STALE_PARTS=0
+for i in $(seq 0 $((${#DEST_DIRS[@]} - 1))); do
+  [[ -d "${DEST_DIRS[$i]}" ]] || continue
+  STALE_PARTS=$(( STALE_PARTS + $(find "${DEST_DIRS[$i]}" -type f -name '*.tar.gz.part' 2>/dev/null | wc -l) ))
 done
-if [[ "$STALE" -gt 0 ]]; then
-  nok "stale transfers" "$STALE FOUND"
+if [[ "$STALE_PARTS" -gt 0 ]]; then
+  nok "stale transfers" "$STALE_PARTS FOUND"
   cont "left by an interrupted run; each is removed as its name is reused"
 else
   ok "stale transfers"
@@ -565,15 +592,15 @@ sub
 
 phase discover 1/4
 
-PLAN=()                                              # server|db|source|bytes|destdir
+COPY_PLAN=()                                              # server|db|source|bytes|destdir
 PLAN_BYTES=0
 
 # Over the entries that HAVE a destination, not over the whole config: the
 # arrays only hold the ones that opted in.
 for i in $(seq 0 $((SYNC_COUNT - 1))); do
-  server="${NAMES[$i]}"
-  src_root="${SRCS[$i]}"
-  dst_root="${DSTS[$i]}"
+  server="${SERVER_NAMES[$i]}"
+  src_root="${SOURCE_DIRS[$i]}"
+  dst_root="${DEST_DIRS[$i]}"
 
   if [[ ! -d "$src_root" ]]; then
     nok "$server" "NO SOURCE DIRECTORY"
@@ -596,7 +623,7 @@ for i in $(seq 0 $((SYNC_COUNT - 1))); do
     fi
 
     bytes="$(fsize "$latest")"
-    PLAN+=("${server}|${db}|${latest}|${bytes}|${dst_root}/${db}")
+    COPY_PLAN+=("${server}|${db}|${latest}|${bytes}|${dst_root}/${db}")
     PLAN_BYTES=$(( PLAN_BYTES + bytes ))
     server_dbs=$((server_dbs + 1))
   done < <(find "$src_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
@@ -604,15 +631,15 @@ for i in $(seq 0 $((SYNC_COUNT - 1))); do
   val "$server" "$server_dbs database(s) -> $dst_root"
 done
 
-PAIRS=${#PLAN[@]}
-[[ $PAIRS -gt 0 ]] \
+COPY_PAIR_COUNT=${#COPY_PLAN[@]}
+[[ $COPY_PAIR_COUNT -gt 0 ]] \
   || die "$(leader 'copy set' 'EMPTY')" \
          "no archive was found for any database of any configured server" \
          "either nothing has been dumped yet, or the base_dir values in" \
          "$CONFIG_FILE do not point where logical.sh published"
 
 sub
-val "copy set" "$PAIRS archive(s), $(hsize "$PLAN_BYTES") before de-duplication"
+val "copy set" "$COPY_PAIR_COUNT archive(s), $(hsize "$PLAN_BYTES") before de-duplication"
 [[ $MISSING_SERVERS -gt 0 ]] && cont "$MISSING_SERVERS server(s) had no source directory"
 [[ $EMPTY_DBS -gt 0 ]] && cont "$EMPTY_DBS database directory/ies held no archive"
 
@@ -639,7 +666,7 @@ fi
 
 phase copy 2/4
 
-for entry in "${PLAN[@]}"; do
+for entry in "${COPY_PLAN[@]}"; do
   IFS='|' read -r server db src bytes dest_dir <<< "$entry"
   CURRENT="${server}/${db}"
 
@@ -745,8 +772,8 @@ fi
 phase retention 3/4
 
 for i in $(seq 0 $((SYNC_COUNT - 1))); do
-  server="${NAMES[$i]}"
-  dst_root="${DSTS[$i]}"
+  server="${SERVER_NAMES[$i]}"
+  dst_root="${DEST_DIRS[$i]}"
   [[ -d "$dst_root" ]] || continue
 
   while IFS= read -r db_dir; do
@@ -829,7 +856,7 @@ fi
 kv "duration" "$(elapsed "$START_EPOCH")"
 kv "config"   "$CONFIG_FILE"
 kv "servers"  "$SERVER_COUNT in config, $SYNC_COUNT with sync_dest, $MISSING_SERVERS with no dumps"
-kv "copy set" "$PAIRS archive(s)"
+kv "copy set" "$COPY_PAIR_COUNT archive(s)"
 kv "copied"   "$COPIED  $(hsize "$COPIED_BYTES")"
 kv "skipped"  "$SKIPPED already present"
 kv "failed"   "$FAILED"

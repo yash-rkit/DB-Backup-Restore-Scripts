@@ -250,6 +250,15 @@ prune_local() {
   return 0
 }
 
+# What actually broke. A die() names its own cause; an uncaught non-zero does
+# not, and used to produce a failure banner with no reason in it at all. These
+# carry what bash knows about that case: the command, its line, its exit code.
+DIED=0
+INTERRUPTED=0
+FAILED_CMD=""
+FAILED_LINE=""
+FAILED_RC=""
+
 fail_run() {
   trap - ERR INT TERM
   local at="$PHASE $STEP"
@@ -257,6 +266,13 @@ fail_run() {
   emit ""
   banner " RESTORE FAILED  ${SERVER_NAME:-(no server)}  ${BACKUP_ID:-(no id)}"
   kv "failed in" "$at"
+  if [[ ${INTERRUPTED:-0} -eq 1 ]]; then
+    kv "cause" "interrupted — Ctrl-C or kill"
+  elif [[ ${DIED:-0} -eq 0 && -n "${FAILED_CMD:-}" ]]; then
+    kv "cause"          "uncaught failure — no check reported this"
+    kv "failed command" "$FAILED_CMD"
+    kv "at line"        "${FAILED_LINE:-?}  (exit ${FAILED_RC:-?})"
+  fi
   kv "duration"  "$(elapsed "$START_EPOCH")"
   sub
 
@@ -334,12 +350,23 @@ fail_run() {
 
 # die <message> [detail...]
 die() {
+  DIED=1
   erro "$1"; shift
   local l; for l in "$@"; do cerr "$l"; done
   fail_run
 }
 
-trap fail_run ERR INT TERM
+# Captured inside the trap, not in fail_run: fail_run's own commands overwrite
+# BASH_COMMAND, so by the time it runs the failing command is already gone.
+on_err() {
+  FAILED_RC=$?
+  FAILED_CMD="$BASH_COMMAND"
+  FAILED_LINE="${BASH_LINENO[0]}"
+  fail_run
+}
+
+trap on_err ERR
+trap 'INTERRUPTED=1; fail_run' INT TERM
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 4  PROBES
@@ -541,10 +568,10 @@ DO_APPLY=1
 
 SELF_CMD="$0 --server_name=$SERVER_NAME --backup_base=$SECONDARY_STORAGE_DIR"
 
-MODE="full (verify + restore + apply)"
-[[ $SKIP_BINLOG -eq 1 ]] && MODE="restore only (--skip-binlog)"
-[[ $BINLOG_ONLY -eq 1 ]] && MODE="binlog apply only (--binlog-only)"
-[[ $DRY_RUN     -eq 1 ]] && MODE="DRY RUN — $MODE"
+RUN_MODE="full (verify + restore + apply)"
+[[ $SKIP_BINLOG -eq 1 ]] && RUN_MODE="restore only (--skip-binlog)"
+[[ $BINLOG_ONLY -eq 1 ]] && RUN_MODE="binlog apply only (--binlog-only)"
+[[ $DRY_RUN     -eq 1 ]] && RUN_MODE="DRY RUN — $RUN_MODE"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 6  SINGLE-INSTANCE LOCK
@@ -675,7 +702,7 @@ banner " RESTORE RUN  $SERVER_NAME  $BACKUP_ID"
 kv "started"    "$(date '+%F %T %Z')"
 kv "host"       "$(hostname -s 2>/dev/null || echo unknown)"
 kv "server"     "$SERVER_NAME"
-kv "mode"       "$MODE"
+kv "mode"       "$RUN_MODE"
 kv "attempt"    "$RUN_STAMP"
 kv "backup id"  "$BACKUP_ID  (from $ID_FROM)"
 kv "backup base" "$SECONDARY_STORAGE_DIR"
@@ -1672,7 +1699,7 @@ emit ""
 banner " RESTORE OK  $SERVER_NAME  $BACKUP_ID"
 kv "duration" "$(elapsed "$START_EPOCH")"
 kv "server"   "$SERVER_NAME"
-kv "mode"     "$MODE"
+kv "mode"     "$RUN_MODE"
 if [[ $DO_RESTORE -eq 1 ]]; then
   kv "archive"       "$SMB_ARCHIVE ($ARCHIVE_SIZE)"
   kv "sha256"        "$EXPECTED_SHA"

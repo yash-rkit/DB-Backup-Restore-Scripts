@@ -9,14 +9,16 @@
     "mode":        "SELECTED",
     "db_list_dir": "/Data/script/dblist",
     "sync_dest":   "/southstorage/backup_latest/Cloud-Live-DB-Every-Key",
-    "retention":   "days:30"
+    "retention":   "days:30",
+    "physical_retention": "days:7"
   },
   {
     "server_name": "Cloud-Live-DB-Default",
     "backup_base": "/livestorage/Backup/Cloud-Live-DB-Default",
     "base_dir":    "/livestorage/Logical/Cloud-Live-DB-Default",
     "sync_dest":   "/southstorage/backup_latest/Cloud-Live-DB-Default",
-    "retention":   "smart"
+    "retention":   "smart",
+    "physical_retention": "smart"
   },
   {
     "server_name": "Cloud-Live-DB-4th-Server",

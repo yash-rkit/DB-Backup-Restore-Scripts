@@ -4,20 +4,31 @@
     "backup_base": "/livestorage/YK/Restore-VM",
     "base_dir": "/livestorage/YK/Logical/Restore-VM",
     "sync_dest": "/southstorage/YK/Restore-VM",
-    "retention": "days:30"
+    "retention": "days:1",
+    "physical_retention": "days:1"
   },
   {
     "server_name": "Restore-VM-1",
     "backup_base": "/livestorage/YK/Restore-VM-1",
     "base_dir": "/livestorage/YK/Logical/Restore-VM-1",
     "sync_dest": "/southstorage/YK/Restore-VM-1",
-    "retention": "days:30"
+    "retention": "days:1",
+    "physical_retention": "days:1"
   },
   {
     "server_name": "Restore-VM-2",
     "backup_base": "/livestorage/YK/Restore-VM-2",
     "base_dir": "/livestorage/YK/Logical/Restore-VM-2",
     "sync_dest": "/southstorage/YK/Restore-VM-2",
-    "retention": "days:30"
+    "retention": "days:1",
+    "physical_retention": "days:1"
+  },
+  {
+    "server_name": "Restore-VM-3",
+    "backup_base": "/livestorage/YK/Restore-VM-3",
+    "base_dir": "/livestorage/YK/Logical/Restore-VM-3",
+    "sync_dest": "/southstorage/YK/Restore-VM-3",
+    "retention": "days:1",
+    "physical_retention": "days:1"
   }
 ]

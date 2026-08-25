@@ -120,6 +120,15 @@ ERRORS=0
 COPYING=""
 STATE_PRE_EXISTED=false
 
+# What actually broke. A die() names its own cause; an uncaught non-zero does
+# not, and used to produce a failure banner with no reason in it at all. These
+# carry what bash knows about that case: the command, its line, its exit code.
+DIED=0
+INTERRUPTED=0
+FAILED_CMD=""
+FAILED_LINE=""
+FAILED_RC=""
+
 fail_run() {
   trap - ERR INT TERM
   local at="$PHASE $STEP"
@@ -127,6 +136,13 @@ fail_run() {
   emit ""
   banner " COLLECTION FAILED  ${ANCHOR_BASE:-(no anchor)}"
   kv "failed in" "$at"
+  if [[ ${INTERRUPTED:-0} -eq 1 ]]; then
+    kv "cause" "interrupted — Ctrl-C or kill"
+  elif [[ ${DIED:-0} -eq 0 && -n "${FAILED_CMD:-}" ]]; then
+    kv "cause"          "uncaught failure — no check reported this"
+    kv "failed command" "$FAILED_CMD"
+    kv "at line"        "${FAILED_LINE:-?}  (exit ${FAILED_RC:-?})"
+  fi
   kv "duration"  "$(elapsed "$START_EPOCH")"
   kv "copied"    "$COPIED before the failure"
   sub
@@ -152,12 +168,23 @@ fail_run() {
 }
 
 die() {
+  DIED=1
   erro "$1"; shift
   local l; for l in "$@"; do cerr "$l"; done
   fail_run
 }
 
-trap fail_run ERR INT TERM
+# Captured inside the trap, not in fail_run: fail_run's own commands overwrite
+# BASH_COMMAND, so by the time it runs the failing command is already gone.
+on_err() {
+  FAILED_RC=$?
+  FAILED_CMD="$BASH_COMMAND"
+  FAILED_LINE="${BASH_LINENO[0]}"
+  fail_run
+}
+
+trap on_err ERR
+trap 'INTERRUPTED=1; fail_run' INT TERM
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 4  PROBES
@@ -535,14 +562,14 @@ fi
 phase verify
 
 GAPS=0
-PREV=""
+PREV_SEQ=""
 while read -r f; do
   S="$(seq_of "$(basename "$f")")"
-  if [[ -n "$PREV" && $((PREV + 1)) -ne $S ]]; then
-    erro "SEQUENCE GAP: $PREV is followed by $S (missing $((PREV + 1)))"
+  if [[ -n "$PREV_SEQ" && $((PREV_SEQ + 1)) -ne $S ]]; then
+    erro "SEQUENCE GAP: $PREV_SEQ is followed by $S (missing $((PREV_SEQ + 1)))"
     GAPS=$((GAPS + 1))
   fi
-  PREV="$S"
+  PREV_SEQ="$S"
 done < <(find "$TARGET_DIR" -maxdepth 1 -type f -name "$BINLOG_GLOB" 2>/dev/null | sort)
 
 if [[ $GAPS -gt 0 ]]; then

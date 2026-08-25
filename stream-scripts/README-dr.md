@@ -138,6 +138,8 @@ Two trees on the primary share. `backup_base` is written by the production host;
 ```
 /livestorage/
 ├── Backup/<server>/                       ← backup_base, one per prod server
+│   │   the seven parts below share one backup id and expire together under
+│   │   physical_retention; deleting the archive alone would strand binlog/<id>
 │   ├── 20260821.xbstream                     physical archive
 │   ├── 20260821.sha256
 │   ├── 20260821.manifest
@@ -250,11 +252,13 @@ A JSON array, processed in order:
 | `mode`        | no       | `ALL` (default) or `SELECTED`                                  |
 | `db_list_dir` | no       | required by `mode: "SELECTED"`                                 |
 | `sync_dest`   | no       | `backup_sync.sh`: destination on the second share              |
-| `retention`   | no       | `db_cleanup.sh`: `"smart"` or `"days:N"`                       |
+| `retention`   | no       | `db_cleanup.sh`: `"smart"` or `"days:N"`, over `base_dir`      |
+| `physical_retention` | no | `db_cleanup.sh`: `"smart"` or `"days:N"`, over `backup_base` |
 
 **This one file drives all four steps.** `final.sh` reads the first eight
 fields; `backup_sync.sh` reads `base_dir` and `sync_dest`; `db_cleanup.sh` reads
-`base_dir` and `retention`. No script carries its own server list, so adding a
+`base_dir` and `retention` for the dumps, and `backup_base` and
+`physical_retention` for the physical backups. No script carries its own server list, so adding a
 server is one JSON entry and removing one cannot leave a stale array behind that
 keeps expiring a tree nothing writes to any more.
 
@@ -268,8 +272,10 @@ does consume it.
 | ----------------------------- | ---------------------------- | ----------------------------- |
 | no `sync_dest` on an entry    | that server is not copied    | —                             |
 | no `sync_dest` on any entry   | **does not run** (skipped)   | —                             |
-| no `retention` on an entry    | —                            | that server is never expired  |
-| no `retention` on any entry   | —                            | **does not run** (skipped)    |
+| no `retention` on an entry    | —                            | that server's dumps never expire |
+| no `retention` on any entry   | —                            | the dump pass deletes nothing |
+| no `physical_retention` on an entry | —                      | that server's `.xbstream` sets never expire |
+| neither retention field anywhere | —                          | **does not run** (skipped)    |
 
 With neither field anywhere, the pipeline restores and dumps and stops: the
 dumps stay on the primary share, nothing is copied, nothing is deleted, and the

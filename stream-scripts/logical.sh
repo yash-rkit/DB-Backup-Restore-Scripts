@@ -212,6 +212,15 @@ prune_local() {
   return 0
 }
 
+# What actually broke. A die() names its own cause; an uncaught non-zero does
+# not, and used to produce a failure banner with no reason in it at all. These
+# carry what bash knows about that case: the command, its line, its exit code.
+DIED=0
+INTERRUPTED=0
+FAILED_CMD=""
+FAILED_LINE=""
+FAILED_RC=""
+
 fail_run() {
   trap - ERR INT TERM                              # no re-entry
   local at="$PHASE $STEP"
@@ -219,6 +228,13 @@ fail_run() {
   emit ""
   banner " LOGICAL BACKUP FAILED  ${SERVER_NAME:-(no server)}  ${RUN_ID:-(no run)}"
   kv "failed in" "$at"
+  if [[ ${INTERRUPTED:-0} -eq 1 ]]; then
+    kv "cause" "interrupted — Ctrl-C or kill"
+  elif [[ ${DIED:-0} -eq 0 && -n "${FAILED_CMD:-}" ]]; then
+    kv "cause"          "uncaught failure — no check reported this"
+    kv "failed command" "$FAILED_CMD"
+    kv "at line"        "${FAILED_LINE:-?}  (exit ${FAILED_RC:-?})"
+  fi
   kv "duration"  "$(elapsed "$START_EPOCH")"
   sub
 
@@ -252,12 +268,23 @@ fail_run() {
 
 # die <message> [detail...]
 die() {
+  DIED=1
   erro "$1"; shift
   local l; for l in "$@"; do cerr "$l"; done
   fail_run
 }
 
-trap fail_run ERR INT TERM
+# Captured inside the trap, not in fail_run: fail_run's own commands overwrite
+# BASH_COMMAND, so by the time it runs the failing command is already gone.
+on_err() {
+  FAILED_RC=$?
+  FAILED_CMD="$BASH_COMMAND"
+  FAILED_LINE="${BASH_LINENO[0]}"
+  fail_run
+}
+
+trap on_err ERR
+trap 'INTERRUPTED=1; fail_run' INT TERM
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 4  PROBES
@@ -608,7 +635,7 @@ fi
 # PARALLEL databases are ever staged at once. Getting this wrong fills the root
 # filesystem of the host that is also running MySQL.
 check
-TOP_MB="$(mysql_q "
+LARGEST_DBS_MB="$(mysql_q "
   SELECT COALESCE(ROUND(SUM(sz)), 0) FROM (
     SELECT SUM(data_length + index_length)/1048576 AS sz
     FROM information_schema.TABLES
@@ -616,22 +643,22 @@ TOP_MB="$(mysql_q "
       ('information_schema','performance_schema','mysql','sys')
     GROUP BY table_schema ORDER BY sz DESC LIMIT ${PARALLEL}
   ) t;" || echo 0)"
-[[ "$TOP_MB" =~ ^[0-9]+$ ]] || TOP_MB=0
+[[ "$LARGEST_DBS_MB" =~ ^[0-9]+$ ]] || LARGEST_DBS_MB=0
 LOCAL_FREE_MB="$(free_mb "$LOCAL_STAGE")"
-LOCAL_NEED_MB=$(( TOP_MB * LOCAL_SPACE_PCT / 100 ))
+LOCAL_NEED_MB=$(( LARGEST_DBS_MB * LOCAL_SPACE_PCT / 100 ))
 
-if [[ "$TOP_MB" -eq 0 ]]; then
+if [[ "$LARGEST_DBS_MB" -eq 0 ]]; then
   nok "staging space" "DATA SIZE UNKNOWN"
   cont "cannot size the staging area from information_schema"
 elif [[ "${LOCAL_FREE_MB:-0}" -lt "$LOCAL_NEED_MB" ]]; then
   die "$(leader 'staging space' 'INSUFFICIENT')" \
       "need ~${LOCAL_NEED_MB}MB in $LOCAL_STAGE, available ${LOCAL_FREE_MB:-0}MB" \
-      "basis: the ${PARALLEL} largest databases total ${TOP_MB}MB, x${LOCAL_SPACE_PCT}%" \
+      "basis: the ${PARALLEL} largest databases total ${LARGEST_DBS_MB}MB, x${LOCAL_SPACE_PCT}%" \
       "each slot holds one .sql and the .tar.gz being built from it" \
       "lower PARALLEL, or give $LOCAL_STAGE more room"
 else
   val "staging space" "need ~${LOCAL_NEED_MB}MB / free ${LOCAL_FREE_MB}MB"
-  cont "basis: ${PARALLEL} largest databases total ${TOP_MB}MB"
+  cont "basis: ${PARALLEL} largest databases total ${LARGEST_DBS_MB}MB"
 fi
 
 check
@@ -644,13 +671,13 @@ else
 fi
 
 check
-PROBE="${BACKUP_DIR}/.sha256_probe_$$"
-echo probe > "$PROBE" 2>/dev/null \
+PROBE_FILE="${BACKUP_DIR}/.sha256_probe_$$"
+echo probe > "$PROBE_FILE" 2>/dev/null \
   || die "$(leader 'sha256 utility' 'WRITE FAILED')" "cannot write to $BACKUP_DIR"
-sha256sum "$PROBE" >/dev/null 2>&1 \
-  || { rm -f "$PROBE"; die "$(leader 'sha256 utility' 'FAILED')" \
+sha256sum "$PROBE_FILE" >/dev/null 2>&1 \
+  || { rm -f "$PROBE_FILE"; die "$(leader 'sha256 utility' 'FAILED')" \
          "sha256sum cannot hash a file on $BACKUP_DIR"; }
-rm -f "$PROBE"
+rm -f "$PROBE_FILE"
 ok "sha256 utility"
 
 # Second-level guard. PART 7 already appends a time when the day is taken, so a

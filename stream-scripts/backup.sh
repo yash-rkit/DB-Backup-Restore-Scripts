@@ -31,7 +31,7 @@ MYSQL_PASSWORD=""
 
 BACKUP_BASE="/Data/dbvault-stage"                    # LOCAL staging, never CIFS
 XB_TMPDIR="/Data/xb-tmp"                             # --tmpdir, --extra-lsndir
-STREAM_SPACE_PCT=60                                  # staging need, % of datadir
+STREAM_SPACE_PCT=40                                  # staging need, % of datadir
 KEEP_LOCAL_DAYS=14                                   # prune logs stranded by a dead share
 
 XTRABACKUP_BIN="/usr/bin/xtrabackup"
@@ -46,7 +46,7 @@ SECONDARY_STORAGE_DIR="/livestorage/YK/Restore-VM"   # permanent home
 SMB_MOUNT_POINT="/livestorage"                       # the CIFS mount point
 
 LOCK_DIR="/var/lock/dbvault"                         # LOCAL; binlog_collect polls
-BINLOG_SCRIPT="/Data/script/binlog_collect.sh"
+BINLOG_SCRIPT=""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 2  LOG ENGINE
@@ -188,13 +188,29 @@ drop() {
   rm -rf "$1" 2>/dev/null || true
 }
 
+# What actually broke. A die() names its own cause; an uncaught non-zero does
+# not, and used to produce a failure banner with no reason in it at all. These
+# carry what bash knows about that case: the command, its line, its exit code.
+DIED=0
+INTERRUPTED=0
+FAILED_CMD=""
+FAILED_LINE=""
+FAILED_RC=""
+
 fail_run() {
   trap - ERR INT TERM                              # no re-entry
   local at="$PHASE $STEP"
 
   emit ""
-  banner " BACKUP FAILED  ${NAME:-(no id)}"
+  banner " BACKUP FAILED  ${BACKUP_ID:-(no id)}"
   kv "failed in" "$at"
+  if [[ ${INTERRUPTED:-0} -eq 1 ]]; then
+    kv "cause" "interrupted — Ctrl-C or kill"
+  elif [[ ${DIED:-0} -eq 0 && -n "${FAILED_CMD:-}" ]]; then
+    kv "cause"          "uncaught failure — no check reported this"
+    kv "failed command" "$FAILED_CMD"
+    kv "at line"        "${FAILED_LINE:-?}  (exit ${FAILED_RC:-?})"
+  fi
   kv "duration"  "$(elapsed "${START_EPOCH:-$(date +%s)}")"
   sub
 
@@ -215,7 +231,7 @@ fail_run() {
   sub
   kv "error log"      "${ERROR_LOG:-(none)}"
   kv "xtrabackup log" "${XTRABACKUP_LOG:-(none)}"
-  banner " RESULT failed id=${NAME:-none} phase=${at% *} step=${at#* } dur_s=$(( $(date +%s) - ${START_EPOCH:-$(date +%s)} )) warn=${WARN_COUNT}"
+  banner " RESULT failed id=${BACKUP_ID:-none} phase=${at% *} step=${at#* } dur_s=$(( $(date +%s) - ${START_EPOCH:-$(date +%s)} )) warn=${WARN_COUNT}"
 
   publish_logs
   exit 1
@@ -223,12 +239,23 @@ fail_run() {
 
 # die <message> [detail...]
 die() {
+  DIED=1
   erro "$1"; shift
   local l; for l in "$@"; do cerr "$l"; done
   fail_run
 }
 
-trap fail_run ERR INT TERM
+# Captured inside the trap, not in fail_run: fail_run's own commands overwrite
+# BASH_COMMAND, so by the time it runs the failing command is already gone.
+on_err() {
+  FAILED_RC=$?
+  FAILED_CMD="$BASH_COMMAND"
+  FAILED_LINE="${BASH_LINENO[0]}"
+  fail_run
+}
+
+trap on_err ERR
+trap 'INTERRUPTED=1; fail_run' INT TERM
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 4  PROBES
@@ -272,9 +299,9 @@ binlog_field() {
 # Bare date for the daily run; a time is appended only when that day's archive
 # already exists. The SHARE is the authoritative test — local staging is emptied
 # after every run, so only a published archive proves the day is taken.
-NAME="$(date +%Y%m%d)"
-if [[ -e "${SECONDARY_STORAGE_DIR}/${NAME}.xbstream" ]]; then
-  NAME="${NAME}_$(date +%H%M%S)"
+BACKUP_ID="$(date +%Y%m%d)"
+if [[ -e "${SECONDARY_STORAGE_DIR}/${BACKUP_ID}.xbstream" ]]; then
+  BACKUP_ID="${BACKUP_ID}_$(date +%H%M%S)"
   SAME_DAY_RERUN=yes
 else
   SAME_DAY_RERUN=no
@@ -282,16 +309,16 @@ fi
 
 START_EPOCH="$(date +%s)"
 
-STREAM_FILE="${BACKUP_BASE}/${NAME}.xbstream"
-CHECKSUM_FILE="${BACKUP_BASE}/${NAME}.sha256"
-BINLOG_INFO_FILE="${BACKUP_BASE}/${NAME}_binlog_info"
-LSN_DIR="${XB_TMPDIR}/${NAME}"                       # only on-disk metadata
+STREAM_FILE="${BACKUP_BASE}/${BACKUP_ID}.xbstream"
+CHECKSUM_FILE="${BACKUP_BASE}/${BACKUP_ID}.sha256"
+BINLOG_INFO_FILE="${BACKUP_BASE}/${BACKUP_ID}_binlog_info"
+LSN_DIR="${XB_TMPDIR}/${BACKUP_ID}"                       # only on-disk metadata
 LOCK_FILE="${LOCK_DIR}/$(basename "$BACKUP_BASE")_$(date +%Y%m%d)_lock"
 
-RUN_LOG="${BACKUP_BASE}/${NAME}_backup.log"
-ERROR_LOG="${BACKUP_BASE}/${NAME}_errors.log"
-XTRABACKUP_LOG="${BACKUP_BASE}/${NAME}_xtrabackup.log"
-SECONDARY_LOG_DIR="${SECONDARY_STORAGE_DIR}/logs/${NAME}"
+RUN_LOG="${BACKUP_BASE}/${BACKUP_ID}_backup.log"
+ERROR_LOG="${BACKUP_BASE}/${BACKUP_ID}_errors.log"
+XTRABACKUP_LOG="${BACKUP_BASE}/${BACKUP_ID}_xtrabackup.log"
+SECONDARY_LOG_DIR="${SECONDARY_STORAGE_DIR}/logs/${BACKUP_ID}"
 
 SECONDARY_FILE=""
 MANIFEST_FILE=""
@@ -316,11 +343,11 @@ for dir in "$BACKUP_BASE" "$XB_TMPDIR" "$LSN_DIR" "$LOCK_DIR"; do
   fi
 done
 
-printf 'errors for backup run %s (started %s)\n\n' "$NAME" "$(date '+%F %T')" > "$ERROR_LOG"
+printf 'errors for backup run %s (started %s)\n\n' "$BACKUP_ID" "$(date '+%F %T')" > "$ERROR_LOG"
 
-banner " BACKUP RUN $NAME"
+banner " BACKUP RUN $BACKUP_ID"
 kv "started"     "$(date '+%F %T %Z')"
-kv "backup id"   "$NAME$([[ "$SAME_DAY_RERUN" == yes ]] && echo "  (same-day rerun — a bare-date archive already exists)")"
+kv "backup id"   "$BACKUP_ID$([[ "$SAME_DAY_RERUN" == yes ]] && echo "  (same-day rerun — a bare-date archive already exists)")"
 kv "host"        "$(hostname -s 2>/dev/null || echo unknown)"
 kv "datadir"     "$MYSQL_DATADIR"
 kv "destination" "$SECONDARY_STORAGE_DIR"
@@ -358,10 +385,10 @@ ok "required binaries"
 # --version line is a [Note] log line, and `| head` under pipefail can trip ERR.
 check
 set +e
-XB_RAW="$("$XTRABACKUP_BIN" --version 2>&1)"
+XTRABACKUP_VERSION_RAW="$("$XTRABACKUP_BIN" --version 2>&1)"
 set -e
-XB_BANNER="$(grep -m1 'xtrabackup version' <<< "$XB_RAW" || true)"
-[[ -n "$XB_BANNER" ]] || XB_BANNER="$(head -1 <<< "$XB_RAW")"
+XB_BANNER="$(grep -m1 'xtrabackup version' <<< "$XTRABACKUP_VERSION_RAW" || true)"
+[[ -n "$XB_BANNER" ]] || XB_BANNER="$(head -1 <<< "$XTRABACKUP_VERSION_RAW")"
 
 if [[ "$XB_BANNER" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
   XB_VER="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
@@ -465,21 +492,21 @@ else
 fi
 
 check
-PROBE="${BACKUP_BASE}/.sha256_probe_$$"
-echo probe > "$PROBE"
-sha256sum "$PROBE" >/dev/null 2>&1 \
-  || { rm -f "$PROBE"; die "$(leader 'sha256 utility' 'FAILED')" \
+PROBE_FILE="${BACKUP_BASE}/.sha256_probe_$$"
+echo probe > "$PROBE_FILE"
+sha256sum "$PROBE_FILE" >/dev/null 2>&1 \
+  || { rm -f "$PROBE_FILE"; die "$(leader 'sha256 utility' 'FAILED')" \
          "sha256sum cannot hash a file on $BACKUP_BASE"; }
-rm -f "$PROBE"
+rm -f "$PROBE_FILE"
 ok "sha256 utility"
 
 check
 # Second-level guard. PART 5 already appends a time when the day is taken, so a
 # collision here means either a same-second rerun, or that the share was
 # unreachable when the name was chosen and the day is in fact taken.
-[[ ! -f "$STREAM_FILE" && ! -f "${SECONDARY_STORAGE_DIR}/${NAME}.xbstream" ]] \
+[[ ! -f "$STREAM_FILE" && ! -f "${SECONDARY_STORAGE_DIR}/${BACKUP_ID}.xbstream" ]] \
   || die "$(leader 'archive name free' 'NO')" \
-         "${NAME}.xbstream already exists" \
+         "${BACKUP_ID}.xbstream already exists" \
          "either a run started in this same second, or the share was unreachable" \
          "when this run picked its name — re-run once it is mounted"
 ok "archive name free"
@@ -632,7 +659,7 @@ phase publish 5/5
 smb_ready || die "the SMB share became unavailable during the backup — cannot publish" \
                  "mount point: $SMB_MOUNT_POINT"
 
-SECONDARY_FILE="${SECONDARY_STORAGE_DIR}/${NAME}.xbstream"
+SECONDARY_FILE="${SECONDARY_STORAGE_DIR}/${BACKUP_ID}.xbstream"
 [[ ! -e "$SECONDARY_FILE" ]] || die "destination already exists: $SECONDARY_FILE"
 
 info "copying $(hsize "$STREAM_BYTES") to the share"
@@ -657,21 +684,21 @@ rm -f "$STREAM_FILE" 2>>"$ERROR_LOG" || warn "could not remove scratch archive"
 
 # Absolute path inside the file, so `sha256sum -c` resolves from anywhere.
 rm -f "$CHECKSUM_FILE" 2>/dev/null || true
-CHECKSUM_FILE="${SECONDARY_STORAGE_DIR}/${NAME}.sha256"
+CHECKSUM_FILE="${SECONDARY_STORAGE_DIR}/${BACKUP_ID}.sha256"
 printf '%s  %s\n' "$BACKUP_SHA256" "$SECONDARY_FILE" > "$CHECKSUM_FILE" 2>>"$ERROR_LOG" \
   || die "failed to write the checksum file to the share"
 ok "checksum published"
 
 # binlog_collect.sh anchors on this and reads only the share.
-cp "$BINLOG_INFO_FILE" "${SECONDARY_STORAGE_DIR}/${NAME}_binlog_info" 2>>"$ERROR_LOG" \
+cp "$BINLOG_INFO_FILE" "${SECONDARY_STORAGE_DIR}/${BACKUP_ID}_binlog_info" 2>>"$ERROR_LOG" \
   || die "failed to publish the binlog anchor"
-[[ -s "${SECONDARY_STORAGE_DIR}/${NAME}_binlog_info" ]] \
+[[ -s "${SECONDARY_STORAGE_DIR}/${BACKUP_ID}_binlog_info" ]] \
   || die "the published binlog anchor is empty"
 rm -f "$BINLOG_INFO_FILE" 2>/dev/null || true
-BINLOG_INFO_FILE="${SECONDARY_STORAGE_DIR}/${NAME}_binlog_info"
+BINLOG_INFO_FILE="${SECONDARY_STORAGE_DIR}/${BACKUP_ID}_binlog_info"
 ok "binlog anchor published"
 
-META_DIR="${SECONDARY_STORAGE_DIR}/meta/${NAME}"
+META_DIR="${SECONDARY_STORAGE_DIR}/meta/${BACKUP_ID}"
 if mkdir -p "$META_DIR" 2>/dev/null; then
   for meta in xtrabackup_checkpoints xtrabackup_info; do
     cp "${LSN_DIR}/${meta}" "${META_DIR}/${meta}" 2>>"$ERROR_LOG" \
@@ -683,9 +710,9 @@ else
   META_DIR="(not published)"
 fi
 
-MANIFEST_FILE="${SECONDARY_STORAGE_DIR}/${NAME}.manifest"
+MANIFEST_FILE="${SECONDARY_STORAGE_DIR}/${BACKUP_ID}.manifest"
 cat > "${MANIFEST_FILE}.part" <<EOF || die "failed to write the manifest"
-backup_id=${NAME}
+backup_id=${BACKUP_ID}
 created_at=$(date '+%F %T')
 archive_path=${SECONDARY_FILE}
 archive_sha256=${BACKUP_SHA256}
@@ -730,7 +757,7 @@ ok "final integrity check"
 rm -f "$LOCK_FILE" 2>/dev/null || true
 
 emit ""
-banner " BACKUP OK  $NAME"
+banner " BACKUP OK  $BACKUP_ID"
 kv "duration"        "$(elapsed "$START_EPOCH")"
 kv "datadir size"    "$(hsize "$DATADIR_BYTES")"
 kv "archive size"    "$(hsize "$STREAM_BYTES")  (${COMPRESSION_PCT}% of datadir)"
@@ -743,8 +770,8 @@ kv "manifest"        "$MANIFEST_FILE"
 kv "metadata"        "$META_DIR"
 kv "warnings"        "$WARN_COUNT"
 sub
-kv "restore with"    "./restore.sh $NAME --dry-run"
-emit "$(printf ' %-16s  %s' '' "./restore.sh $NAME")"
+kv "restore with"    "./restore.sh $BACKUP_ID --dry-run"
+emit "$(printf ' %-16s  %s' '' "./restore.sh $BACKUP_ID")"
 sub
 kv "logs"            "$SECONDARY_LOG_DIR/"
 
@@ -767,7 +794,7 @@ else
 fi
 
 PHASE="done"; STEP="-"
-banner " RESULT ok id=${NAME} dur_s=$(( $(date +%s) - START_EPOCH )) bytes=${STREAM_BYTES} warn=${WARN_COUNT}"
+banner " RESULT ok id=${BACKUP_ID} dur_s=$(( $(date +%s) - START_EPOCH )) bytes=${STREAM_BYTES} warn=${WARN_COUNT}"
 
 publish_logs
 
