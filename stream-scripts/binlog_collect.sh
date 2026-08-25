@@ -244,8 +244,23 @@ if ! mountpoint -q "$SMB_MOUNT_POINT"; then
   exit 1
 fi
 
+# A missing directory is ambiguous, and the parent tells the two cases apart.
+# backup.sh is the only thing that creates this path, so on a server whose
+# binlog cron starts before its first backup the directory is simply not there
+# yet — the normal state of a new server between midnight and its noon backup,
+# and not worth an error every fifteen minutes. But if the PARENT is missing
+# too, the share layout is wrong rather than merely empty, and that is the
+# typo this check has always existed to catch.
 if [[ ! -d "$SECONDARY_STORAGE_DIR" ]]; then
+  PARENT_DIR="$(dirname "$SECONDARY_STORAGE_DIR")"
+  if [[ -d "$PARENT_DIR" ]]; then
+    echo " no backup directory yet: $SECONDARY_STORAGE_DIR"
+    echo " backup.sh creates it on its first run — nothing to collect"
+    exit 0
+  fi
   echo "[ERROR] Mounted, but missing: $SECONDARY_STORAGE_DIR" >&2
+  echo "[ERROR] Its parent is missing too: $PARENT_DIR" >&2
+  echo "[ERROR] That is a wrong path, not a server awaiting its first backup." >&2
   exit 1
 fi
 
