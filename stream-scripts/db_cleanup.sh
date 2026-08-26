@@ -76,14 +76,14 @@ SMART_WEEKLY_KEEP=3
 ALWAYS_KEEP_NEWEST=1
 
 # This script's own logs, published here as one directory per run.
-CLEANUP_LOG_BASE="/livestorage/final/_cleanup_logs"
+CLEANUP_LOG_BASE="/livestorage/final/cleanup_logs"
 KEEP_CLEANUP_LOG_DAYS=60
 
 LOCAL_STAGE="/Data/dbvault-stage"                    # logs only, during the run
 KEEP_LOCAL_DAYS=14                                   # prune logs stranded here
 
 # Directories inside a server's dump tree that are not databases.
-NON_DB_DIRS="logs manifests _cleanup_logs"
+NON_DB_DIRS="logs manifests cleanup_logs"
 
 LOCK_DIR="/var/lock/dbvault"
 

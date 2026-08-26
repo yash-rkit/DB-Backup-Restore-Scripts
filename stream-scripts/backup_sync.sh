@@ -58,7 +58,7 @@ LOCAL_STAGE="/Data/dbvault-stage"                    # logs only, during the run
 KEEP_LOCAL_DAYS=14                                   # prune logs stranded here
 
 # Directories inside a server's dump tree that are not databases.
-NON_DB_DIRS="logs manifests _cleanup_logs"
+NON_DB_DIRS="logs manifests cleanup_logs"
 
 LOCK_DIR="/var/lock/dbvault"
 

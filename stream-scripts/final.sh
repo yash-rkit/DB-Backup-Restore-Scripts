@@ -55,7 +55,7 @@ MYSQL_SERVICE="mysql"
 
 # Where the run log is published. One directory per pipeline run, beside the
 # dumps rather than inside any one server's tree.
-PIPELINE_LOG_BASE="/livestorage/final/_pipeline_logs"
+PIPELINE_LOG_BASE="/livestorage/final/pipeline_logs"
 
 LOCK_DIR="/var/lock/dbvault"
 

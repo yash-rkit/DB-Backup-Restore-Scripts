@@ -155,8 +155,8 @@ Two trees on the primary share. `backup_base` is written by the production host;
 │   ├── manifests/20260821.manifest
 │   └── logs/20260821/                         ← logical.sh publishes here
 │
-├── final/_pipeline_logs/<stamp>/           ← final.sh publishes here
-└── final/_cleanup_logs/<stamp>/            ← db_cleanup.sh publishes here
+├── final/pipeline_logs/<stamp>/           ← final.sh publishes here
+└── final/cleanup_logs/<stamp>/            ← db_cleanup.sh publishes here
 
 /southstorage/                             ← the second share
 ├── <sync_dest>/<database>/<database>_20260821.tar.gz(+.sha256)
@@ -762,7 +762,7 @@ VM snapshot of the restore VM first.
 Every script's log ends with one greppable line:
 
 ```bash
-grep -h ' RESULT ' /livestorage/final/_pipeline_logs/*/pipeline.log | tail -20
+grep -h ' RESULT ' /livestorage/final/pipeline_logs/*/pipeline.log | tail -20
 ```
 
 ```
