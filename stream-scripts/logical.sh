@@ -47,12 +47,6 @@ BACKUP_MODE="ALL"                                    # ALL or SELECTED
 DB_LIST_DIR=""                                       # SELECTED: dir of .txt/.csv/.lst
 
 PARALLEL=3
-SPACE_REQUIRED_PCT=60                                # share need, % of live data
-
-# Local staging need, as a percentage of the PARALLEL largest databases. Each
-# slot holds one .sql and the .tar.gz being built from it at the same time, so
-# the floor is the uncompressed size plus the archive.
-LOCAL_SPACE_PCT=130
 
 # --hex-blob is deliberately NOT set: no binary columns in these schemas.
 # Add it back if any are introduced.
@@ -123,7 +117,7 @@ nok() { warn "$(leader "$1" "$2")"; }
 skp() { info "$(leader "$1" "$2")"; }
 
 CHECK_N=0
-CHECK_TOTAL=15
+CHECK_TOTAL=13
 PHASE_EPOCH=0
 
 phase() { PHASE="$1"; STEP="${2:--}"; PHASE_EPOCH="$(date +%s)"; }
@@ -290,8 +284,6 @@ trap 'INTERRUPTED=1; fail_run' INT TERM
 # PART 4  PROBES
 # ═══════════════════════════════════════════════════════════════════════════
 
-free_mb() { df -BM --output=avail "$1" | tail -1 | tr -dc '0-9'; }
-
 # -h is omitted entirely when MYSQL_HOST is empty: that is what selects the
 # local socket rather than a TCP connection to 'localhost'.
 mysql_args() {
@@ -402,24 +394,15 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 7  IDENTITY AND PATHS
 #
-# Bare date, with a time appended only when that day's archives already exist —
-# the same rule as backup.sh. The SHARE is the authoritative test: local
-# staging is emptied after every database, so only a published archive proves
-# the day is taken. The test must stay AFTER the lock, or two runs starting
-# together both decide they are the first and overwrite one set of archives.
+# Full date and time, always: <database>_YYYY-MM-DD_HH-MM-SS.tar.gz. Every run
+# is therefore distinct, so a second run on the same day cannot collide with
+# the first and no rerun suffix is needed.
 # ═══════════════════════════════════════════════════════════════════════════
 
 BACKUP_DIR="$BASE_DIR"
 MANIFEST_DIR="${BASE_DIR}/manifests"
 
-RUN_ID="$(date +%Y%m%d)"
-SAME_DAY_RERUN=no
-if [[ -d "$BACKUP_DIR" ]] \
-   && find "$BACKUP_DIR" -mindepth 2 -maxdepth 2 -type f -name "*_${RUN_ID}.tar.gz" \
-        -print -quit 2>/dev/null | grep -q .; then
-  RUN_ID="${RUN_ID}_$(date +%H%M%S)"
-  SAME_DAY_RERUN=yes
-fi
+RUN_ID="$(date +%Y-%m-%d_%H-%M-%S)"
 
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_LOG="${LOCAL_STAGE}/${SERVER_NAME}_logical_${RUN_STAMP}.log"
@@ -452,7 +435,7 @@ banner " LOGICAL BACKUP RUN  $SERVER_NAME  $RUN_ID"
 kv "started"     "$(date '+%F %T %Z')"
 kv "host"        "$(hostname -s 2>/dev/null || echo unknown)"
 kv "server"      "$SERVER_NAME"
-kv "run id"      "$RUN_ID$([[ "$SAME_DAY_RERUN" == yes ]] && echo "  (same-day rerun — bare-date archives already exist)")"
+kv "run id"      "$RUN_ID"
 kv "source"      "${MYSQL_HOST:-local socket}"
 kv "destination" "$BACKUP_DIR"
 kv "staging"     "$BUILD_DIR (dump, archive, checksum — then moved to the share)"
@@ -606,59 +589,6 @@ if [[ "$BACKUP_MODE" == "SELECTED" ]]; then
   val "db list dir" "$(basename "$DB_LIST_FILE")"
 else
   skp "db list dir" "n/a (mode=ALL)"
-fi
-
-check
-DATA_SIZE_MB="$(mysql_q "
-  SELECT COALESCE(ROUND(SUM(data_length + index_length)/1048576), 0)
-  FROM information_schema.TABLES
-  WHERE table_schema NOT IN
-    ('information_schema','performance_schema','mysql','sys');" || echo 0)"
-[[ "$DATA_SIZE_MB" =~ ^[0-9]+$ ]] || DATA_SIZE_MB=0
-FREE_MB="$(free_mb "$BACKUP_DIR")"
-REQUIRED_MB=$(( DATA_SIZE_MB * SPACE_REQUIRED_PCT / 100 ))
-
-if [[ "$DATA_SIZE_MB" -eq 0 ]]; then
-  nok "share space" "DATA SIZE UNKNOWN"
-  cont "information_schema reported 0MB of user data — the run cannot be sized"
-elif [[ "${FREE_MB:-0}" -lt "$REQUIRED_MB" ]]; then
-  die "$(leader 'share space' 'INSUFFICIENT')" \
-      "need ~${REQUIRED_MB}MB (${SPACE_REQUIRED_PCT}% of ${DATA_SIZE_MB}MB of live data)" \
-      "available ${FREE_MB:-0}MB in $BACKUP_DIR" \
-      "only finished archives are written here, so this is the compressed total"
-else
-  val "share space" "need ~${REQUIRED_MB}MB / free ${FREE_MB}MB"
-fi
-
-# Local staging is sized on the PARALLEL LARGEST databases, not on the whole
-# dataset: a slot is freed as soon as its archive is on the share, so at most
-# PARALLEL databases are ever staged at once. Getting this wrong fills the root
-# filesystem of the host that is also running MySQL.
-check
-LARGEST_DBS_MB="$(mysql_q "
-  SELECT COALESCE(ROUND(SUM(sz)), 0) FROM (
-    SELECT SUM(data_length + index_length)/1048576 AS sz
-    FROM information_schema.TABLES
-    WHERE table_schema NOT IN
-      ('information_schema','performance_schema','mysql','sys')
-    GROUP BY table_schema ORDER BY sz DESC LIMIT ${PARALLEL}
-  ) t;" || echo 0)"
-[[ "$LARGEST_DBS_MB" =~ ^[0-9]+$ ]] || LARGEST_DBS_MB=0
-LOCAL_FREE_MB="$(free_mb "$LOCAL_STAGE")"
-LOCAL_NEED_MB=$(( LARGEST_DBS_MB * LOCAL_SPACE_PCT / 100 ))
-
-if [[ "$LARGEST_DBS_MB" -eq 0 ]]; then
-  nok "staging space" "DATA SIZE UNKNOWN"
-  cont "cannot size the staging area from information_schema"
-elif [[ "${LOCAL_FREE_MB:-0}" -lt "$LOCAL_NEED_MB" ]]; then
-  die "$(leader 'staging space' 'INSUFFICIENT')" \
-      "need ~${LOCAL_NEED_MB}MB in $LOCAL_STAGE, available ${LOCAL_FREE_MB:-0}MB" \
-      "basis: the ${PARALLEL} largest databases total ${LARGEST_DBS_MB}MB, x${LOCAL_SPACE_PCT}%" \
-      "each slot holds one .sql and the .tar.gz being built from it" \
-      "lower PARALLEL, or give $LOCAL_STAGE more room"
-else
-  val "staging space" "need ~${LOCAL_NEED_MB}MB / free ${LOCAL_FREE_MB}MB"
-  cont "basis: ${PARALLEL} largest databases total ${LARGEST_DBS_MB}MB"
 fi
 
 check
