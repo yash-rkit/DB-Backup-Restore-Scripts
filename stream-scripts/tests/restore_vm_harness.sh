@@ -16,7 +16,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET="${SCRIPT_DIR}/../restore_vm.sh"
+TARGET="${SCRIPT_DIR}/../scripts/restore_vm.sh"
 [[ -f "$TARGET" ]] || { echo "cannot find restore_vm.sh next to tests/"; exit 1; }
 
 H="$(mktemp -d)"; export HARNESS="$H"

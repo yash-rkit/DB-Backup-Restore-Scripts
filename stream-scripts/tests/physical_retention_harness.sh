@@ -21,7 +21,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET="${SCRIPT_DIR}/../db_cleanup.sh"
+TARGET="${SCRIPT_DIR}/../scripts/db_cleanup.sh"
 [[ -f "$TARGET" ]] || { echo "cannot find db_cleanup.sh next to tests/"; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "this harness needs node for the jq stub"; exit 1; }
 
