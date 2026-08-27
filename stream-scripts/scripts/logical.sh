@@ -7,7 +7,7 @@
 # no cross-database point in time here, and no PITR.
 # Docs: stream-scripts/README-dr.md
 #
-#   PART 1   configuration
+#   PART 1   configuration        1A set per VM / 1B tune / 1C shared
 #   PART 2   log engine
 #   PART 3   failure handling
 #   PART 4   probes
@@ -25,44 +25,67 @@ set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 1  CONFIGURATION
+#
+#   1A  SET PER VM    __SET_ME__ until filled in; the script refuses to start
+#   1B  TUNING        working defaults
+#   1C  SHARED        must match the other scripts on this host
+#   1D  NOT SET HERE  detected at run time, or passed as arguments
+#
+# What each one means, and what breaks when it is wrong: docs/README-dr.md §11
 # ═══════════════════════════════════════════════════════════════════════════
 
-MYSQL_USER="Admin"
-MYSQL_PASSWORD=""
+# ── 1A  SET PER VM ─────────────────────────────────────────────────────────
+MYSQL_USER="__SET_ME__"                              # needs SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER
+MYSQL_PASSWORD="__SET_ME__"
+MYSQL_HOST="__SET_ME__"                              # the LOCAL restored instance; "" = local socket
+SMB_MOUNT_POINT="__SET_ME__"                         # the mount point itself, e.g. /livestorage
 
-# The instance to dump. On the restore VM this is the local, just-restored
-# server — its own address, or empty for the local socket. It is NOT a
-# production host: pointing it at one turns this into load on live data.
-MYSQL_HOST="20.20.15.4"
-
-# Per-server, from --server_name / --base_dir (PART 5).
-SERVER_NAME=""
-BASE_DIR=""                                          # this server's dump root
-
-SMB_MOUNT_POINT="/livestorage"                       # the CIFS mount point
-LOCAL_STAGE="/Data/dbvault-stage"                    # logs and dump staging
+# ── 1B  TUNING ─────────────────────────────────────────────────────────────
 KEEP_LOCAL_DAYS=14                                   # prune logs stranded here
-
-BACKUP_MODE="ALL"                                    # ALL or SELECTED
+BACKUP_MODE="ALL"                                    # ALL or SELECTED; --mode= overrides
 DB_LIST_DIR=""                                       # SELECTED: dir of .txt/.csv/.lst
-
-PARALLEL=3
+PARALLEL=3                                           # databases dumped at once
+SOURCE_CHECK=1                                       # refuse if the newest marker is another server
 
 # --hex-blob is deliberately NOT set: no binary columns in these schemas.
-# Add it back if any are introduced.
 DUMP_OPTS="--single-transaction --quick --routines --events --triggers \
 --set-gtid-purged=OFF --default-character-set=utf8mb4 \
 --net-buffer-length=1M"
 
-MYSQL_BIN="/usr/bin/mysql"
-MYSQLDUMP_BIN="/usr/bin/mysqldump"
-
+# ── 1C  SHARED ─────────────────────────────────────────────────────────────
+LOCAL_STAGE="/Data/dbvault-stage"                    # logs and dump staging
 LOCK_DIR="/var/lock/dbvault"
 STATE_DIR="/var/lib/dbvault"                         # restore_vm.sh markers
 
-# Refuse to dump unless the newest restore marker on this host belongs to
-# SERVER_NAME. See the check in PART 8 for why.
-SOURCE_CHECK=1
+# ── 1D  NOT SET HERE ───────────────────────────────────────────────────────
+# Binaries resolved in PART 5, right after the guard. An env var still wins.
+MYSQL_BIN="${MYSQL_BIN:-}"                           # PATH
+MYSQLDUMP_BIN="${MYSQLDUMP_BIN:-}"                   # PATH
+
+SERVER_NAME=""                                       # --server_name=
+BASE_DIR=""                                          # --base_dir=, this server's dump root
+
+# ── 1E  GUARD ──────────────────────────────────────────────────────────────
+# Refuses to start while any 1A value is still __SET_ME__. Called in PART 5,
+# because --mysql_host= can supply one of them.
+
+SET_ME_VARS=(MYSQL_USER MYSQL_PASSWORD MYSQL_HOST SMB_MOUNT_POINT)
+
+check_set_me() {
+  local v
+  local -a missing=()
+  for v in "${SET_ME_VARS[@]}"; do
+    if [[ "${!v}" == "__SET_ME__" ]]; then missing+=("$v"); fi
+  done
+  if (( ${#missing[@]} == 0 )); then return 0; fi
+  {
+    printf '[ERROR] %s has not been configured for this host.\n' "${BASH_SOURCE[0]##*/}"
+    printf '        Open it, find PART 1A, and replace __SET_ME__ in:\n'
+    printf '          %s\n' "${missing[@]}"
+    printf '        Nothing has been read, written or deleted.\n'
+  } >&2
+  exit 1
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 2  LOG ENGINE
@@ -306,6 +329,23 @@ writable() {
   return 0
 }
 
+# PART 1D: looked up in PATH, unless the environment named one.
+resolve_bin() {
+  local var="$1" name="$2"
+  local path="${!var}"
+  if [[ -n "$path" ]]; then
+    if [[ -x "$path" ]]; then return 0; fi
+    echo "[ERROR] $var is set to '$path', which is not an executable file." >&2
+    exit 1
+  fi
+  path="$(command -v "$name" 2>/dev/null || true)"
+  if [[ -z "$path" ]]; then
+    echo "[ERROR] '$name' is not in PATH — install it, or run with $var=/full/path/to/$name" >&2
+    exit 1
+  fi
+  printf -v "$var" '%s' "$path"
+}
+
 kf() { [[ -f "$2" ]] && awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$2"; return 0; }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -355,6 +395,13 @@ for arg in "$@"; do
     *) echo "[ERROR] Unknown argument: $arg" >&2; usage ;;
   esac
 done
+
+# PART 1E, deferred to here: --mysql_host= has now had its chance to supply
+# one of the values the guard insists on.
+check_set_me
+
+resolve_bin MYSQL_BIN     mysql
+resolve_bin MYSQLDUMP_BIN mysqldump
 
 [[ -n "$SERVER_NAME" ]] || argfail "--server_name is required"
 [[ -n "$BASE_DIR" ]]    || argfail "--base_dir is required"

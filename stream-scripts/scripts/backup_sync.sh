@@ -11,7 +11,7 @@
 # uses: base_dir is the source, sync_dest is the destination.
 # Docs: stream-scripts/README-dr.md
 #
-#   PART 1   configuration
+#   PART 1   configuration        1A set per VM / 1B tune / 1C shared
 #   PART 2   log engine
 #   PART 3   failure handling
 #   PART 4   probes
@@ -29,40 +29,59 @@ set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 1  CONFIGURATION
+#
+#   1A  SET PER VM    __SET_ME__ until filled in; the script refuses to start
+#   1B  TUNING        working defaults
+#   1C  SHARED        must match the other scripts on this host
+#   1D  NOT SET HERE  detected at run time, or passed as arguments
+#
+# What each one means, and what breaks when it is wrong: docs/README-dr.md §11
 # ═══════════════════════════════════════════════════════════════════════════
 
-# The server list. Per entry this script reads:
-#   base_dir    the source: where logical.sh published that server's dumps
-#   sync_dest   the destination on the second share
-#
-# sync_dest is OPT-IN: an entry without it is not copied anywhere, and a config
-# where no entry has it means there is nothing for this script to do. There is
-# deliberately no default destination — inventing one would start copying data
-# somewhere nobody asked for.
-CONFIG_FILE="/Data/script/servers.json"
+# Per-server settings — which trees to copy, and where to — live in
+# servers.json, not here.
 
-SOURCE_MOUNT_POINT="/livestorage"                    # where base_dir lives
-DEST_MOUNT_POINT="/southstorage"                     # where sync_dest lives
+# ── 1A  SET PER VM ─────────────────────────────────────────────────────────
+SOURCE_MOUNT_POINT="__SET_ME__"                      # mount point holding every base_dir
+DEST_MOUNT_POINT="__SET_ME__"                        # mount point holding every sync_dest — a DIFFERENT filer
 
-# This script's own logs, published here as one directory per run.
-SYNC_LOG_BASE="/southstorage/backup_latest/_sync_logs"
+# ── 1B  TUNING ─────────────────────────────────────────────────────────────
+SYNC_LOG_BASE="/southstorage/backup_latest/_sync_logs"   # this script's logs; keep it under DEST_MOUNT_POINT
 DEST_LOG_DAYS=30
-
-ARCHIVE_GLOB="*.tar.gz"
-
-# Destination retention, in whole days. 0 would delete a copy the moment it was
-# made, so the pre-flight refuses it.
-DEST_RETENTION_DAYS=3
-
-LOCAL_STAGE="/Data/dbvault-stage"                    # logs only, during the run
+DEST_RETENTION_DAYS=3                                # destination retention, whole days; 0 is refused
 KEEP_LOCAL_DAYS=14                                   # prune logs stranded here
 
-# Directories inside a server's dump tree that are not databases.
-NON_DB_DIRS="logs manifests cleanup_logs"
-
+# ── 1C  SHARED ─────────────────────────────────────────────────────────────
+CONFIG_FILE="/Data/script/servers.json"              # the server list; --config= overrides
+LOCAL_STAGE="/Data/dbvault-stage"                    # logs only, during the run
 LOCK_DIR="/var/lock/dbvault"
+ARCHIVE_GLOB="*.tar.gz"
+NON_DB_DIRS="logs manifests cleanup_logs"            # dirs in a dump tree that are not databases
 
-DRY_RUN=0
+# ── 1D  NOT SET HERE ───────────────────────────────────────────────────────
+DRY_RUN=0                                            # --dry-run
+
+# ── 1E  GUARD ──────────────────────────────────────────────────────────────
+# Refuses to start while any 1A value is still __SET_ME__.
+
+SET_ME_VARS=(SOURCE_MOUNT_POINT DEST_MOUNT_POINT)
+
+check_set_me() {
+  local v
+  local -a missing=()
+  for v in "${SET_ME_VARS[@]}"; do
+    if [[ "${!v}" == "__SET_ME__" ]]; then missing+=("$v"); fi
+  done
+  if (( ${#missing[@]} == 0 )); then return 0; fi
+  {
+    printf '[ERROR] %s has not been configured for this host.\n' "${BASH_SOURCE[0]##*/}"
+    printf '        Open it, find PART 1A, and replace __SET_ME__ in:\n'
+    printf '          %s\n' "${missing[@]}"
+    printf '        Nothing has been read, written or deleted.\n'
+  } >&2
+  exit 1
+}
+check_set_me
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 2  LOG ENGINE

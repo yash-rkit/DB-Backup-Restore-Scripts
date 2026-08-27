@@ -14,7 +14,7 @@
 # and nowhere else — see the CONFIRM_RESTORE_VM check in PART 8.
 # Docs: stream-scripts/README-dr.md
 #
-#   PART 1   configuration
+#   PART 1   configuration        1A set per VM / 1B tune / 1C shared
 #   PART 2   log engine
 #   PART 3   failure handling
 #   PART 4   probes
@@ -32,45 +32,73 @@ set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 1  CONFIGURATION
+#
+#   1A  SET PER VM    __SET_ME__ until filled in; the script refuses to start
+#   1B  TUNING        working defaults
+#   1C  SHARED        must match the other scripts on this host
+#   1D  NOT SET HERE  detected at run time, or passed as arguments
+#
+# What each one means, and what breaks when it is wrong: docs/README-dr.md §11
 # ═══════════════════════════════════════════════════════════════════════════
 
-# This script wipes the datadir once per configured server. The switch is here
-# so that copying the deployment onto a production host does not turn it into a
-# machine that erases itself nightly. 0 = refuse to run.
-CONFIRM_RESTORE_VM=1
+# Which servers run, and in what order, lives in servers.json, not here.
 
-# Child scripts. Deployed side by side by default; each is overridable so a
-# host can pin a known-good copy.
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-RESTORE_SCRIPT="${SCRIPT_DIR}/restore_vm.sh"
-LOGICAL_SCRIPT="${SCRIPT_DIR}/logical.sh"
-SYNC_SCRIPT="${SCRIPT_DIR}/backup_sync.sh"
-CLEANUP_SCRIPT="${SCRIPT_DIR}/db_cleanup.sh"
+# ── 1A  SET PER VM ─────────────────────────────────────────────────────────
+# 1 on the dedicated restore VM and nowhere else: this pipeline erases the
+# datadir once per server in servers.json, every night, unattended.
+CONFIRM_RESTORE_VM="__SET_ME__"                      # 1 = restore VM, 0 = refuse to run
+SMB_MOUNT_POINT="__SET_ME__"                         # the mount point itself; MUST match the children
 
-SMB_MOUNT_POINT="/livestorage"                       # MUST match the children
-LOCAL_STAGE="/Data/dbvault-stage"                    # logs, during the run
+# ── 1B  TUNING ─────────────────────────────────────────────────────────────
+PIPELINE_LOG_BASE="/livestorage/final/pipeline_logs" # one directory per pipeline run
 KEEP_LOCAL_DAYS=14                                   # prune logs stranded here
+SHUTDOWN_DELAY_MIN=10
+SHUTDOWN_ON_FAILURE=1                                # every log is on the share by then
 
-MYSQL_SERVICE="mysql"
-
-# Where the run log is published. One directory per pipeline run, beside the
-# dumps rather than inside any one server's tree.
-PIPELINE_LOG_BASE="/livestorage/final/pipeline_logs"
-
+# ── 1C  SHARED ─────────────────────────────────────────────────────────────
+CONFIG_FILE="/Data/script/servers.json"              # the server list; --config= overrides
+LOCAL_STAGE="/Data/dbvault-stage"                    # logs, during the run
 LOCK_DIR="/var/lock/dbvault"
 
-SHUTDOWN_DELAY_MIN=10
-# Shut down even when something failed. Every log is published to the share
-# before this point, so there is nothing on the VM left to read.
-SHUTDOWN_ON_FAILURE=1
+# ── 1D  NOT SET HERE ───────────────────────────────────────────────────────
+# Children are found beside this script; each path is still overridable, to
+# pin a known-good copy. MYSQL_SERVICE is detected in pre-flight.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RESTORE_SCRIPT="${RESTORE_SCRIPT:-${SCRIPT_DIR}/restore_vm.sh}"
+LOGICAL_SCRIPT="${LOGICAL_SCRIPT:-${SCRIPT_DIR}/logical.sh}"
+SYNC_SCRIPT="${SYNC_SCRIPT:-${SCRIPT_DIR}/backup_sync.sh}"
+CLEANUP_SCRIPT="${CLEANUP_SCRIPT:-${SCRIPT_DIR}/db_cleanup.sh}"
 
-CONFIG_FILE=""
-BACKUP_DATE=""
-SKIP_BINLOG=0
-SKIP_SYNC=0
-SKIP_CLEANUP=0
-NO_SHUTDOWN=0
-DRY_RUN=0
+MYSQL_SERVICE="${MYSQL_SERVICE:-}"                   # mysql / mysqld / mariadb
+
+BACKUP_DATE=""                                       # --backup_date=
+SKIP_BINLOG=0                                        # --skip-binlog
+SKIP_SYNC=0                                          # --skip-sync
+SKIP_CLEANUP=0                                       # --skip-cleanup
+NO_SHUTDOWN=0                                        # --no-shutdown
+DRY_RUN=0                                            # --dry-run
+
+# ── 1E  GUARD ──────────────────────────────────────────────────────────────
+# Refuses to start while any 1A value is still __SET_ME__.
+
+SET_ME_VARS=(CONFIRM_RESTORE_VM SMB_MOUNT_POINT)
+
+check_set_me() {
+  local v
+  local -a missing=()
+  for v in "${SET_ME_VARS[@]}"; do
+    if [[ "${!v}" == "__SET_ME__" ]]; then missing+=("$v"); fi
+  done
+  if (( ${#missing[@]} == 0 )); then return 0; fi
+  {
+    printf '[ERROR] %s has not been configured for this host.\n' "${BASH_SOURCE[0]##*/}"
+    printf '        Open it, find PART 1A, and replace __SET_ME__ in:\n'
+    printf '          %s\n' "${missing[@]}"
+    printf '        Nothing has been read, written or deleted.\n'
+  } >&2
+  exit 1
+}
+check_set_me
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 2  LOG ENGINE
@@ -321,7 +349,7 @@ run_child() {
 
 usage() {
   cat <<EOF
-Usage: $0 --config=PATH [--backup_date=YYYYMMDD] [--skip-binlog]
+Usage: $0 [--config=PATH] [--backup_date=YYYYMMDD] [--skip-binlog]
           [--skip-sync] [--skip-cleanup] [--no-shutdown] [--dry-run]
 
   Step 1  servers  per server: restore_vm.sh, then logical.sh
@@ -330,6 +358,7 @@ Usage: $0 --config=PATH [--backup_date=YYYYMMDD] [--skip-binlog]
   then     shutdown -h +${SHUTDOWN_DELAY_MIN}
 
   --config=PATH           JSON list of servers to process, in order
+                          (default: $CONFIG_FILE, set in PART 1C)
   --backup_date=YYYYMMDD  restore each server's LATEST archive from this date
                           (default: today) — passed straight to restore_vm.sh
   --skip-binlog           restore to the backup point only, for every server
@@ -384,7 +413,6 @@ EOF
 
 argfail() { echo "[ERROR] $1" >&2; trap - ERR INT TERM; exit 1; }
 
-[[ $# -ge 1 ]] || usage
 
 for arg in "$@"; do
   case "$arg" in
@@ -400,7 +428,7 @@ for arg in "$@"; do
   esac
 done
 
-[[ -n "$CONFIG_FILE" ]] || argfail "--config is required"
+[[ -n "$CONFIG_FILE" ]] || argfail "CONFIG_FILE is empty — set it in PART 1C, or pass --config=PATH"
 [[ -f "$CONFIG_FILE" ]] || argfail "Config file not found: $CONFIG_FILE"
 if [[ -n "$BACKUP_DATE" ]] && ! [[ "$BACKUP_DATE" =~ ^[0-9]{8}$ ]]; then
   argfail "Invalid --backup_date: $BACKUP_DATE (expected YYYYMMDD)"
@@ -695,12 +723,16 @@ writable "$LOCAL_STAGE" \
 ok "local stage writable"
 
 check
-if systemctl cat "$MYSQL_SERVICE" >/dev/null 2>&1 \
-   || systemctl cat mysqld >/dev/null 2>&1; then
-  ok "mysql service"
+if [[ -z "$MYSQL_SERVICE" ]]; then
+  for unit in mysql mysqld mariadb; do
+    if systemctl cat "$unit.service" >/dev/null 2>&1; then MYSQL_SERVICE="$unit"; break; fi
+  done
+fi
+if [[ -n "$MYSQL_SERVICE" ]]; then
+  val "mysql service" "$MYSQL_SERVICE"
 else
   nok "mysql service" "UNIT NOT FOUND"
-  cont "neither $MYSQL_SERVICE nor mysqld is a known unit on this host"
+  cont "no mysql, mysqld or mariadb unit on this host"
   cont "the restore step stops and starts it — it will fail if this is wrong"
 fi
 

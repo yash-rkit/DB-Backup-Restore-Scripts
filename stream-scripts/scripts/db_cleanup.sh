@@ -23,7 +23,7 @@
 # Servers, their trees and their patterns come from the same JSON file final.sh
 # uses. Docs: stream-scripts/README-dr.md
 #
-#   PART 1   configuration
+#   PART 1   configuration        1A set per VM / 1B tune / 1C shared
 #   PART 2   log engine
 #   PART 3   failure handling
 #   PART 4   probes
@@ -40,54 +40,65 @@ set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 1  CONFIGURATION
+#
+#   1A  SET PER VM    __SET_ME__ until filled in; the script refuses to start
+#   1B  TUNING        working defaults
+#   1C  SHARED        must match the other scripts on this host
+#   1D  NOT SET HERE  detected at run time, or passed as arguments
+#
+# What each one means, and what breaks when it is wrong: docs/README-dr.md §11
 # ═══════════════════════════════════════════════════════════════════════════
 
-# The server list. Per entry this script reads:
-#   base_dir             the dump tree to expire — where logical.sh published
-#   retention            "smart" or "days:N", applied to base_dir
-#   backup_base          the physical tree — where backup.sh published
-#   physical_retention   "smart" or "days:N", applied to backup_base
-#
-# Both rules are OPT-IN and independent: an entry without retention keeps every
-# dump, an entry without physical_retention keeps every physical set, and a
-# config with neither anywhere means there is nothing for this script to do.
-# There is deliberately no default — a script whose only job is rm must delete
-# exactly what it was told to and nothing by assumption.
-CONFIG_FILE="/Data/script/servers.json"
+# Per-server settings — which trees to expire, and how hard — live in
+# servers.json, not here. This script deletes nothing for an entry that does
+# not ask.
 
-SMB_MOUNT_POINT="/livestorage"
+# ── 1A  SET PER VM ─────────────────────────────────────────────────────────
+SMB_MOUNT_POINT="__SET_ME__"                         # mount point itself; all that stands between rm and /
 
-ARCHIVE_GLOB="*.tar.gz"
-
-# The physical side. The archive glob finds the set; every other part is derived
-# from the backup ID that the archive's own name carries.
-PHYSICAL_GLOB="*.xbstream"
-PHYS_SET_SUFFIXES=".xbstream .sha256 .manifest _binlog_info"
-PHYS_SET_DIRS="binlog meta logs"
-
-# smart: full daily coverage for this many days, then one archive per week.
-SMART_DAILY_DAYS=7
-SMART_WEEKLY_KEEP=3
-
-# Never delete the last remaining archive of a database, or the last remaining
-# physical set of a server, however old either is. A server that stopped
-# producing backups is exactly when the old one matters — and on the physical
-# side it is the only restore path there is.
-ALWAYS_KEEP_NEWEST=1
-
-# This script's own logs, published here as one directory per run.
-CLEANUP_LOG_BASE="/livestorage/final/cleanup_logs"
+# ── 1B  TUNING ─────────────────────────────────────────────────────────────
+SMART_DAILY_DAYS=7                                   # smart: daily coverage for this long,
+SMART_WEEKLY_KEEP=3                                  #   then this many weeklies
+ALWAYS_KEEP_NEWEST=1                                 # never delete a database's or server's last one
+CLEANUP_LOG_BASE="/livestorage/final/cleanup_logs"   # this script's logs
 KEEP_CLEANUP_LOG_DAYS=60
-
-LOCAL_STAGE="/Data/dbvault-stage"                    # logs only, during the run
 KEEP_LOCAL_DAYS=14                                   # prune logs stranded here
 
-# Directories inside a server's dump tree that are not databases.
-NON_DB_DIRS="logs manifests cleanup_logs"
-
+# ── 1C  SHARED ─────────────────────────────────────────────────────────────
+CONFIG_FILE="/Data/script/servers.json"              # the server list; --config= overrides
+LOCAL_STAGE="/Data/dbvault-stage"                    # logs only, during the run
 LOCK_DIR="/var/lock/dbvault"
 
-DRY_RUN=0
+ARCHIVE_GLOB="*.tar.gz"                              # finds a logical set
+PHYSICAL_GLOB="*.xbstream"                           # finds a physical set
+PHYS_SET_SUFFIXES=".xbstream .sha256 .manifest _binlog_info"
+PHYS_SET_DIRS="binlog meta logs"
+NON_DB_DIRS="logs manifests cleanup_logs"            # dirs in a dump tree that are not databases
+
+# ── 1D  NOT SET HERE ───────────────────────────────────────────────────────
+DRY_RUN=0                                            # --dry-run
+
+# ── 1E  GUARD ──────────────────────────────────────────────────────────────
+# Refuses to start while any 1A value is still __SET_ME__.
+
+SET_ME_VARS=(SMB_MOUNT_POINT)
+
+check_set_me() {
+  local v
+  local -a missing=()
+  for v in "${SET_ME_VARS[@]}"; do
+    if [[ "${!v}" == "__SET_ME__" ]]; then missing+=("$v"); fi
+  done
+  if (( ${#missing[@]} == 0 )); then return 0; fi
+  {
+    printf '[ERROR] %s has not been configured for this host.\n' "${BASH_SOURCE[0]##*/}"
+    printf '        Open it, find PART 1A, and replace __SET_ME__ in:\n'
+    printf '          %s\n' "${missing[@]}"
+    printf '        Nothing has been read, written or deleted.\n'
+  } >&2
+  exit 1
+}
+check_set_me
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 2  LOG ENGINE

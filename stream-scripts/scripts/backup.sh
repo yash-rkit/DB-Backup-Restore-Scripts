@@ -5,7 +5,7 @@
 # Publishes an UNPREPARED .xbstream; restore.sh runs --prepare.
 # Docs: stream-scripts/physical/README.md
 #
-#   PART 1   configuration
+#   PART 1   configuration        1A set per VM / 1B tune / 1C shared
 #   PART 2   log engine
 #   PART 3   failure handling
 #   PART 4   probes
@@ -24,29 +24,63 @@ set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 1  CONFIGURATION
+#
+#   1A  SET PER VM    __SET_ME__ until filled in; the script refuses to start
+#   1B  TUNING        working defaults
+#   1C  SHARED        must match the other scripts on this host
+#   1D  NOT SET HERE  detected at run time, or passed as arguments
+#
+# What each one means, and what breaks when it is wrong: docs/README.md §11
 # ═══════════════════════════════════════════════════════════════════════════
 
-MYSQL_USER="Admin"
-MYSQL_PASSWORD=""
+# ── 1A  SET PER VM ─────────────────────────────────────────────────────────
+MYSQL_USER="__SET_ME__"                              # backup account
+MYSQL_PASSWORD="__SET_ME__"
+SECONDARY_STORAGE_DIR="__SET_ME__"                   # this host's dir on the share — ONE PER SERVER
+SMB_MOUNT_POINT="__SET_ME__"                         # the mount point itself, e.g. /livestorage
 
-BACKUP_BASE="/Data/dbvault-stage"                    # LOCAL staging, never CIFS
+# ── 1B  TUNING ─────────────────────────────────────────────────────────────
 XB_TMPDIR="/Data/xb-tmp"                             # --tmpdir, --extra-lsndir
 STREAM_SPACE_PCT=40                                  # staging need, % of datadir
 KEEP_LOCAL_DAYS=14                                   # prune logs stranded by a dead share
 
-XTRABACKUP_BIN="/usr/bin/xtrabackup"
-MYSQL_BIN="/usr/bin/mysql"
-MYSQL_DATADIR="/Data/mysql"
+PARALLEL_THREADS=""                                  # read threads;  blank = half the cores
+COMPRESS_THREADS=""                                  # zstd threads;  blank = half the cores
+ZSTD_LEVEL=1                                         # the link is the bottleneck, not the CPU
 
-PARALLEL_THREADS=8
-COMPRESS_THREADS=8
-ZSTD_LEVEL=1
+BINLOG_SCRIPT=""                                     # collector to run inline (PART 14); empty = don't
 
-SECONDARY_STORAGE_DIR="/livestorage/YK/Restore-VM"   # permanent home
-SMB_MOUNT_POINT="/livestorage"                       # the CIFS mount point
+# ── 1C  SHARED ─────────────────────────────────────────────────────────────
+BACKUP_BASE="/Data/dbvault-stage"                    # LOCAL staging; basename must match binlog_collect.sh
+LOCK_DIR="/var/lock/dbvault"                         # LOCAL; binlog_collect.sh polls it
 
-LOCK_DIR="/var/lock/dbvault"                         # LOCAL; binlog_collect polls
-BINLOG_SCRIPT=""
+# ── 1D  NOT SET HERE ───────────────────────────────────────────────────────
+# Resolved in PART 6 (binaries) and PART 7 (datadir). An env var still wins.
+MYSQL_DATADIR="${MYSQL_DATADIR:-}"                   # SELECT @@datadir
+XTRABACKUP_BIN="${XTRABACKUP_BIN:-}"                 # PATH
+MYSQL_BIN="${MYSQL_BIN:-}"                           # PATH
+
+# ── 1E  GUARD ──────────────────────────────────────────────────────────────
+# Refuses to start while any 1A value is still __SET_ME__.
+
+SET_ME_VARS=(MYSQL_USER MYSQL_PASSWORD SECONDARY_STORAGE_DIR SMB_MOUNT_POINT)
+
+check_set_me() {
+  local v
+  local -a missing=()
+  for v in "${SET_ME_VARS[@]}"; do
+    if [[ "${!v}" == "__SET_ME__" ]]; then missing+=("$v"); fi
+  done
+  if (( ${#missing[@]} == 0 )); then return 0; fi
+  {
+    printf '[ERROR] %s has not been configured for this host.\n' "${BASH_SOURCE[0]##*/}"
+    printf '        Open it, find PART 1A, and replace __SET_ME__ in:\n'
+    printf '          %s\n' "${missing[@]}"
+    printf '        Nothing has been read, written or deleted.\n'
+  } >&2
+  exit 1
+}
+check_set_me
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 2  LOG ENGINE
@@ -264,6 +298,33 @@ trap 'INTERRUPTED=1; fail_run' INT TERM
 free_gb() { df -BG "$1" | awk 'NR==2 {print $4}' | sed 's/G//'; }
 mysql_q() { "$MYSQL_BIN" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -NBe "$1" 2>/dev/null; }
 
+
+# PART 1B: empty (or 0) = half the cores. Fill the variable in to pin a number.
+auto_threads() {
+  local cores half
+  cores=$(nproc 2>/dev/null || echo 0)
+  if (( cores < 1 )); then cores=2; fi
+  half=$(( cores / 2 ))
+  if (( half < 1 )); then half=1; fi
+  printf '%s' "$half"
+}
+# PART 1D: looked up in PATH, unless the environment named one.
+resolve_bin() {
+  local var="$1" name="$2"
+  local path="${!var}"
+  if [[ -n "$path" ]]; then
+    if [[ -x "$path" ]]; then return 0; fi
+    echo "[ERROR] $var is set to '$path', which is not an executable file." >&2
+    exit 1
+  fi
+  path="$(command -v "$name" 2>/dev/null || true)"
+  if [[ -z "$path" ]]; then
+    echo "[ERROR] '$name' is not in PATH — install it, or run with $var=/full/path/to/$name" >&2
+    exit 1
+  fi
+  printf -v "$var" '%s' "$path"
+}
+
 writable() {
   local probe="$1/.probe_$$"
   touch "$probe" 2>/dev/null || return 1
@@ -328,6 +389,12 @@ META_DIR=""
 # PART 6  BOOTSTRAP
 # ═══════════════════════════════════════════════════════════════════════════
 
+resolve_bin XTRABACKUP_BIN xtrabackup
+resolve_bin MYSQL_BIN      mysql
+
+if [[ -z "$PARALLEL_THREADS" || "$PARALLEL_THREADS" == "0" ]]; then PARALLEL_THREADS="$(auto_threads)"; fi
+if [[ -z "$COMPRESS_THREADS" || "$COMPRESS_THREADS" == "0" ]]; then COMPRESS_THREADS="$(auto_threads)"; fi
+
 if [[ -z "$SECONDARY_STORAGE_DIR" ]]; then
   echo "[ERROR] SECONDARY_STORAGE_DIR is empty — the backup has nowhere to go." >&2
   exit 1
@@ -349,7 +416,7 @@ banner " BACKUP RUN $BACKUP_ID"
 kv "started"     "$(date '+%F %T %Z')"
 kv "backup id"   "$BACKUP_ID$([[ "$SAME_DAY_RERUN" == yes ]] && echo "  (same-day rerun — a bare-date archive already exists)")"
 kv "host"        "$(hostname -s 2>/dev/null || echo unknown)"
-kv "datadir"     "$MYSQL_DATADIR"
+kv "datadir"     "${MYSQL_DATADIR:-resolved in pre-flight, from @@datadir}"
 kv "destination" "$SECONDARY_STORAGE_DIR"
 kv "staging"     "$BACKUP_BASE"
 kv "compression" "zstd level $ZSTD_LEVEL"
@@ -369,7 +436,7 @@ PREFLIGHT_EPOCH="$PHASE_EPOCH"
 check
 if [[ $EUID -ne 0 ]]; then
   nok "user privileges" "NOT ROOT"
-  cont "must read $MYSQL_DATADIR and write $SECONDARY_STORAGE_DIR"
+  cont "must read the MySQL datadir and write $SECONDARY_STORAGE_DIR"
 else
   ok "user privileges"
 fi
@@ -410,14 +477,26 @@ mysql_up || die "$(leader 'mysql running' 'NO')"
 ok "mysql running"
 
 check
-[[ -d "$MYSQL_DATADIR" && -r "$MYSQL_DATADIR" ]] \
-  || die "$(leader 'datadir readable' 'NO')" "missing or unreadable: $MYSQL_DATADIR"
-ok "datadir readable"
-
-check
 mysql_q "SELECT 1" >/dev/null \
   || die "$(leader 'mysql connection' 'FAILED')" "user: $MYSQL_USER"
 ok "mysql connection"
+
+# PART 1D: the running server is the only authority on its own datadir.
+check
+if [[ -z "$MYSQL_DATADIR" ]]; then
+  MYSQL_DATADIR="$(mysql_q 'SELECT @@datadir' || true)"
+  MYSQL_DATADIR="${MYSQL_DATADIR%/}"
+  DATADIR_SOURCE="@@datadir"
+  [[ -n "$MYSQL_DATADIR" ]] \
+    || die "$(leader 'datadir readable' 'UNKNOWN')" \
+           "SELECT @@datadir returned nothing" \
+           "run with MYSQL_DATADIR=/path/to/datadir to override"
+else
+  DATADIR_SOURCE="environment"
+fi
+[[ -d "$MYSQL_DATADIR" && -r "$MYSQL_DATADIR" ]] \
+  || die "$(leader 'datadir readable' 'NO')" "missing or unreadable: $MYSQL_DATADIR"
+val "datadir readable" "$MYSQL_DATADIR  ($DATADIR_SOURCE)"
 
 check
 for dir in "$BACKUP_BASE" "$LSN_DIR"; do

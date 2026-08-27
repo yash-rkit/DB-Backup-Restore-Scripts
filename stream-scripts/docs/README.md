@@ -517,7 +517,7 @@ Each script opens with an index and is divided into numbered `PART` regions in
 execution order:
 
 ```
-#   PART 1   configuration
+#   PART 1   configuration        1A set per VM / 1B tune / 1C shared
 #   PART 2   log engine
 #   PART 3   failure handling
 #   PART 4   probes
@@ -528,10 +528,22 @@ execution order:
 ...
 ```
 
-Parts 1–4 are definitions only — nothing executes. Parts 5 onward run top to
-bottom with no jumps back, so reading the file in order is reading the run in
-order. The phase names in the log match the PART names, so a log line points at
-a region of the file:
+PART 1 is itself split by who touches it — 1A per VM, 1B tuning, 1C shared with
+the other scripts, 1D resolved at run time — and §11 is the reference for it.
+
+Parts 2–4 are definitions only. Two things do execute before PART 5:
+
+- **the 1A guard**, at the end of PART 1, which stops the run while any per-VM
+  value is still `__SET_ME__`. It is deliberately the first executable line in
+  the file: before the log engine, before any directory is created, before the
+  share is touched.
+- **the 1D resolvers**, at the end of PART 4 (or in PART 6 for `backup.sh`),
+  which find the binaries, the systemd unit and the datadir. They are as late as
+  possible while still being ahead of the first use.
+
+Everything else runs top to bottom with no jumps back, so reading the file in
+order is reading the run in order. The phase names in the log match the PART
+names, so a log line points at a region of the file:
 
 ```
 14:53:56 INFO  [verify 2/5]      backup_type ...     →  PART 9  VERIFY
@@ -709,8 +721,8 @@ two, same guarantee.
 | 2 | required binaries | fails |
 | 3 | xtrabackup version | fails below 8.0.30; **warns** if unparseable |
 | 4 | mysql running | fails |
-| 5 | datadir readable | fails |
-| 6 | mysql connection | fails |
+| 5 | mysql connection | fails |
+| 6 | datadir readable | fails — and this is where `MYSQL_DATADIR` is resolved from `@@datadir`, which is why it now runs after the connection rather than before |
 | 7 | staging writable | fails — checks `BACKUP_BASE` and the `--extra-lsndir` |
 | 8 | smb share | fails — mountpoint, mkdir, write probe |
 | 9 | disk space | fails — `STREAM_SPACE_PCT`% of the datadir, on staging **and** the share |
@@ -723,7 +735,9 @@ two, same guarantee.
 
 Compared with the tar chain: `tar` and `gzip` are gone from check 2 and the
 tar/gzip round-trip test is gone entirely, since nothing compresses with them.
-Checks 3, 12, 13 and 15 are new.
+Checks 3, 12, 13 and 15 are new. Checks 5 and 6 swapped places when the datadir
+stopped being a setting: the server has to answer before it can be asked where
+its datadir is.
 
 **Check 3** deserves a note, because it is the one that has actually bitten.
 `--compress-zstd-level` requires XtraBackup 8.0.30. Detecting that up front is
@@ -886,6 +900,23 @@ date + time keys:     20260820 000000  <  20260820 143005   ← correct
 
 No anchor at all is a clean exit 0 — the backup has not completed yet, there is
 genuinely nothing to collect.
+
+### PART 8 — where the binlogs are
+
+`BINLOG_BASE` is not configured. PART 8 asks the server:
+
+```bash
+BINLOG_BASE="$(mysql_q 'SELECT @@log_bin_basename')"
+BINLOG_DIR="$(dirname "$BINLOG_BASE")"
+BINLOG_PREFIX="$(basename "$BINLOG_BASE")"
+```
+
+A hardcoded path that no longer matches the server's `log_bin` finds an empty
+directory. The collector then copies nothing, detects no gap — there is no
+sequence to be discontinuous — and writes `RESULT ok`. For the one script the
+whole PITR chain depends on, a silent clean run is the worst failure available,
+so the value comes from the only source that cannot go stale. It is printed in
+the header with its origin, and `BINLOG_BASE=…` in the environment overrides it.
 
 ### PART 10 — start point
 
@@ -1073,40 +1104,119 @@ fail a check it actually passes.
 
 ## 11. Configuration reference
 
-### Must match across scripts
+Every script's PART 1 is split into the same blocks, by who touches it:
 
-| Setting | Why |
-| --- | --- |
-| `SECONDARY_STORAGE_DIR` | the collector and the restore find nothing if it differs |
-| `SMB_MOUNT_POINT` | `mountpoint -q` only returns true for the exact mount point |
-| `LOCK_DIR` + `BACKUP_BASE` basename | `backup.sh` writes the lock, `binlog_collect.sh` polls it |
-| `BACKUP_BASE` / `LOCAL_STAGE` | the same local staging path under two names |
-| `BINLOG_PREFIX` / `BINLOG_BASE` | must match MySQL's `log_bin` basename |
-| `STATE_DIR` | the restore marker; `restore.sh` writes and reads it |
+| Tier | Heading      | Rule |
+| ---- | ------------ | ---- |
+| 1A   | SET PER VM   | Ships as `__SET_ME__`. The script refuses to start while any is untouched. |
+| 1B   | TUNING       | Working defaults. Change for a measured reason. |
+| 1C   | SHARED       | The other scripts on this host assume these values. Change in all of them, or none. |
+| 1D   | NOT SET HERE | Detected at run time, or passed as arguments. Nothing to fill in. |
+| 1E   | GUARD        | The check itself. |
+
+The guard runs before the log engine, before any directory is created and
+before the share is touched, so a misconfigured copy costs a second and changes
+nothing:
+
+```
+[ERROR] backup.sh has not been configured for this host.
+        Open it, find PART 1A, and replace __SET_ME__ in:
+          MYSQL_USER
+          MYSQL_PASSWORD
+          SECONDARY_STORAGE_DIR
+          SMB_MOUNT_POINT
+        Nothing has been read, written or deleted.
+```
+
+That exists because the alternative is silent. A `backup.sh` copied to a second
+host with its `SECONDARY_STORAGE_DIR` left alone runs perfectly and publishes
+into the first host's directory; `binlog_collect.sh` then anchors on whichever
+backup finished last and interleaves two PITR chains in one tree. Nothing fails,
+nothing warns, and it is discovered during a restore.
+
+### 1A — the per-VM values
+
+| Setting | In | What it is |
+| --- | --- | --- |
+| `MYSQL_USER`, `MYSQL_PASSWORD` | all three | the account. `backup.sh` needs `BACKUP_ADMIN`, `RELOAD`, `PROCESS`, `LOCK TABLES`, `REPLICATION CLIENT` |
+| `SECONDARY_STORAGE_DIR` | all three | this server's permanent directory on the share. **One per server** — see below |
+| `SMB_MOUNT_POINT` | all three | the CIFS mount point itself, not a directory beneath it. `mountpoint -q` is true only for the exact mount path, and that check is what stops a dropped share from being written to as a plain local directory |
+
+`SECONDARY_STORAGE_DIR` and `SMB_MOUNT_POINT` must be **byte-for-byte identical**
+in `backup.sh`, `binlog_collect.sh` and `restore.sh` on the same host. The
+collector finds the anchor `backup.sh` published and the restore reads the same
+tree; a value that differs by a trailing slash finds nothing and reports an
+empty chain rather than an error.
 
 > The two chains share the anchor filename, the lock name and the `binlog/`
-> layout, so **do not point both at the same `SECONDARY_STORAGE_DIR`.** The
-> collector would anchor on whichever backup ran last and mix both chains' PITR
-> state in one tree. One share directory per chain.
+> layout, so **do not point two hosts at the same `SECONDARY_STORAGE_DIR`.**
+> One share directory per chain.
 
-### Stream-specific
+### 1B — tuning
 
-| Setting | Default | Notes |
+| Setting | Script | Default | Notes |
+| --- | --- | --- | --- |
+| `PARALLEL_THREADS` | `backup.sh` | blank | xtrabackup read threads. Blank = half the cores of whatever host it lands on; fill in a number to pin it |
+| `COMPRESS_THREADS` | `backup.sh` | blank | zstd threads, same rule. Half plus half is about one core count, which leaves the box able to serve queries — check 13 warns if the pair exceeds twice the cores |
+| `ZSTD_LEVEL` | `backup.sh` | `1` | the link is the bottleneck, not the CPU |
+| `STREAM_SPACE_PCT` | `backup.sh` | `40` | staging requirement, % of the datadir |
+| `XB_TMPDIR` | `backup.sh` | `/Data/xb-tmp` | `--tmpdir`, and the parent of `--extra-lsndir` |
+| `BINLOG_SCRIPT` | `backup.sh` | empty | collector to run inline once the archive is published. Empty leaves it to its own cron entry |
+| `LOCK_STALE_SECONDS` | `binlog_collect.sh` | `21600` | 6h; past that the collector assumes `backup.sh` crashed |
+| `PARALLEL_THREADS` | `restore.sh` | blank | xbstream and `--decompress`, same rule as above |
+| `PREPARE_USE_MEMORY` | `restore.sh` | `1G` | xtrabackup's own default is 100MB, which makes the redo apply crawl |
+| `DATADIR_SPACE_PCT` | `restore.sh` | `120` | restore requirement, % of the source datadir |
+| `ARCHIVE_EXPANSION_FACTOR` | `restore.sh` | `5` | fallback when the manifest carries no `datadir_bytes` |
+| `STAGE_ARCHIVE`, `ARCHIVE_STAGE_DIR`, `KEEP_STAGED_ON_FAILURE` | `restore.sh` | `1` | copy the archive local before the wipe; a retry then skips the copy |
+| `XBSTREAM_DECOMPRESS` | `restore.sh` | `0` | one-pass extract. Verify the build first: `xbstream --help` and look for `decompress` |
+| `MYSQL_READY_TIMEOUT`, `MYSQL_READY_INTERVAL` | `restore.sh` | `900`, `2` | how long to wait for the restored server to accept a connection |
+| `CONFIRM_WIPE` | `restore.sh` | `1` | `0` disables restores on this host entirely |
+| `KEEP_LOCAL_DAYS` | all three | `14` | prunes logs stranded locally by a dead share |
+
+### 1C — shared between the scripts
+
+| Setting | Value | Why it has to match |
 | --- | --- | --- |
-| `ZSTD_LEVEL` | `1` | the network copy, not the CPU, is the bottleneck |
-| `PARALLEL_THREADS` | `8` | read threads on backup, decompress threads on restore |
-| `COMPRESS_THREADS` | `8` | backup only |
-| `STREAM_SPACE_PCT` | `60` | staging requirement, % of datadir |
-| `XB_TMPDIR` | `/Data/xb-tmp` | `--tmpdir` and the parent of `--extra-lsndir` |
-| `LOCK_STALE_SECONDS` | `21600` | 6h; past this the collector assumes backup.sh crashed |
-| `DATADIR_SPACE_PCT` | `120` | restore requirement, % of source datadir |
-| `ARCHIVE_EXPANSION_FACTOR` | `5` | fallback when the manifest has no `datadir_bytes` |
-| `PREPARE_USE_MEMORY` | `1G` | xtrabackup's default is 100MB, which makes the redo apply crawl |
-| `CONFIRM_WIPE` | `1` | set to `0` to disable restores on this host entirely |
+| `BACKUP_BASE` / `BACKUP_BASE_NAME` | `/Data/dbvault-stage` | local staging, never CIFS. `backup.sh` builds its lock name from this path's basename and `binlog_collect.sh` polls for that exact name, so `BACKUP_BASE_NAME` is that basename |
+| `LOCK_DIR` | `/var/lock/dbvault` | `backup.sh` writes the lock, `binlog_collect.sh` polls it |
+| `LOCAL_STAGE` | `/Data/dbvault-stage` | the same local staging path, under the name `restore.sh` uses |
+| `STATE_DIR` | `/var/lib/dbvault` | the restore marker; `restore.sh` writes and reads it |
+| `BINLOG_PREFIX` | `binlog` | in `restore.sh`: the **producing** host's `log_bin` basename, which is what names the binlog files on the share — not this host's. `binlog_collect.sh` does not have this setting at all; it asks the server |
 
-`PARALLEL_THREADS=8` and `COMPRESS_THREADS=8` assume a host with cores to spare.
-Lower them on a busy user-facing primary; check 13 warns if their sum exceeds
-twice the core count.
+### 1D — not set anywhere
+
+Resolved at run time. Each honours an environment variable, for the rare host
+where the detected answer is wrong.
+
+| Value | How it is found | Override |
+| --- | --- | --- |
+| `MYSQL_DATADIR` | `backup.sh`: `SELECT @@datadir`, in pre-flight, right after the connection check. `restore.sh`: the same, then `my_print_defaults mysqld` when the server is down | `MYSQL_DATADIR=/srv/mysql ./backup.sh` |
+| `BINLOG_BASE` | `binlog_collect.sh`: `SELECT @@log_bin_basename` | `BINLOG_BASE=/srv/mysql/binlog ./binlog_collect.sh` |
+| `MYSQL_SERVICE` | `restore.sh`: the first of `mysql`, `mysqld`, `mariadb` that `systemctl cat` knows | `MYSQL_SERVICE=mysqld ./restore.sh 20260820` |
+| `XTRABACKUP_BIN`, `XBSTREAM_BIN`, `MYSQL_BIN`, `MYSQLADMIN_BIN`, `MYSQLBINLOG_BIN` | `command -v` | `XTRABACKUP_BIN=/opt/pxb/bin/xtrabackup ./backup.sh` |
+
+Two of these are worth understanding.
+
+**The datadir.** `backup.sh` reads it, `restore.sh` erases it. A path typed into
+a file that was later copied to another host is the expensive kind of wrong, and
+the running server always knows the answer. `restore.sh` needs a second source
+because it also runs when MySQL is down — `my_print_defaults` reads the same
+`my.cnf` `mysqld` itself would read, so a VM whose MySQL has never started still
+resolves. If neither answers, it stops rather than guessing at a directory it is
+about to delete.
+
+**The binlog path.** A stale `BINLOG_BASE` points the collector at a directory
+that does not exist or is empty. It copies nothing, finds no gap, and writes a
+clean run to the log — the worst failure available to the one script PITR
+depends on. `@@log_bin_basename` cannot go stale.
+
+Both print their source in the run header, so a log records what was used rather
+than what the file says today:
+
+```
+ datadir         : /Data/mysql  (@@datadir)
+ source          : /Data/mysql/binlog  (@@log_bin_basename)
+```
 
 ---
 
@@ -1117,6 +1227,28 @@ twice the core count.
 ```bash
 install -m 700 backup.sh binlog_collect.sh restore.sh /Data/script/
 mkdir -p /Data/dbvault-stage /Data/xb-tmp
+```
+
+Then fill in PART 1A of each. Run one and it names the lines:
+
+```
+[ERROR] backup.sh has not been configured for this host.
+        Open it, find PART 1A, and replace __SET_ME__ in:
+          MYSQL_USER
+          MYSQL_PASSWORD
+          SECONDARY_STORAGE_DIR
+          SMB_MOUNT_POINT
+        Nothing has been read, written or deleted.
+```
+
+Four values per script, twelve in all, and `SECONDARY_STORAGE_DIR` and
+`SMB_MOUNT_POINT` have to be identical across the three. Nothing else in PART 1
+has to change to deploy on a new host: the datadir, the binlog path and every
+binary are asked for at run time (§11, 1D). Confirm what a host resolved to
+without running a backup:
+
+```bash
+/Data/script/restore.sh --dry-run 20260820 | head -20
 ```
 
 `backup.sh` runs `binlog_collect.sh` inline via `BINLOG_SCRIPT`, so that path

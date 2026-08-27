@@ -33,6 +33,7 @@ document does not repeat them. Read that first.
 | 8   | [`db_cleanup.sh`](#8-db_cleanupsh)                            |
 | 9   | [What is deliberately not here](#9-what-is-deliberately-not-here)   |
 | 10  | [Deploying and first run](#10-deploying-and-first-run)        |
+| 11  | [Configuration reference](#11-configuration-reference)        |
 
 ---
 
@@ -100,8 +101,10 @@ logs, its staged binlog directory and its dry-run preview the same way.
 
 **`CONFIRM_RESTORE_VM`.** `final.sh` erases the datadir once per configured
 server. On a production host that is a self-inflicted outage repeated N times.
-The switch is a pre-flight check, in the same spirit as `CONFIRM_WIPE`: it exists
-so that a deployment copied onto the wrong machine refuses to run.
+The switch exists so that a deployment copied onto the wrong machine refuses to
+run — which only works while it ships unset, so it is a PART 1A value: it
+arrives as `__SET_ME__` and the run stops until somebody decides, on that host,
+which answer is true. See §11.
 
 ### 2.2 The destination is CIFS, and CIFS lies
 
@@ -196,10 +199,12 @@ name (`NON_DB_DIRS`) and skip anything beginning with `.` or `_`. Without that,
 ## 4. `final.sh`
 
 ```
-final.sh --config=/Data/script/servers.json
-         [--backup_date=YYYYMMDD] [--skip-binlog]
+final.sh [--config=PATH] [--backup_date=YYYYMMDD] [--skip-binlog]
          [--skip-sync] [--skip-cleanup] [--no-shutdown] [--dry-run]
 ```
+
+No arguments in normal use. The server list comes from `CONFIG_FILE` in PART
+1C, default `/Data/script/servers.json`; `--config=PATH` overrides it.
 
 ### PART layout
 
@@ -509,10 +514,10 @@ machinery (commented out in the original) dropped.
 
 ### The connection
 
-`MYSQL_HOST` in PART 1, `--mysql_host=` to override, empty for the local socket.
-On the restore VM this must be the instance `restore_vm.sh` just rebuilt. It is
-not a production host: pointing it at one turns a DR drill into load on live
-data.
+`MYSQL_HOST` in PART 1A, `--mysql_host=` to override, empty for the local
+socket. On the restore VM this must be the instance `restore_vm.sh` just
+rebuilt. It is not a production host: pointing it at one turns a DR drill into
+load on live data.
 
 ### The source check
 
@@ -697,13 +702,12 @@ a run that aborted mid-pass left retention partly applied.
 
 ## 9. What is deliberately not here
 
-- **No retention for the physical archives or the collected binlogs.**
-  `db_cleanup.sh` touches the logical dumps only. The `.xbstream` archives,
-  `binlog/`, and `meta/` under each `backup_base` still grow without limit —
-  the same gap [CLAUDE.md](../CLAUDE.md) records for `stream-scripts/`. Whatever
-  prunes them has to reason about which archive is still the newest usable
-  baseline for a server, and about the binlog tail that belongs to it; that is a
-  different job from expiring a dump.
+- **No retention for anything an entry did not ask for.** `db_cleanup.sh`
+  expires the logical dumps under `base_dir` when an entry carries `retention`,
+  and the physical sets under `backup_base` when it carries
+  `physical_retention`. An entry with neither keeps everything, for ever. There
+  is deliberately no default: a script whose only job is `rm` deletes what it
+  was told to and nothing by assumption.
 - **No cross-database consistency in the dumps.** `--single-transaction` gives
   each database an internally consistent snapshot at its own moment. The
   physical archive underneath is a single point in time; the dump set taken from
@@ -728,13 +732,40 @@ install -m 644 servers.example.json /Data/script/servers.json   # then edit it
 bash -n /Data/script/final.sh
 ```
 
-Then, in this order:
+### Then fill in PART 1A
+
+Each script ships with its per-VM settings set to `__SET_ME__` and **refuses to
+start** until they are replaced. Run one and it names the lines to edit:
+
+```
+[ERROR] final.sh has not been configured for this host.
+        Open it, find PART 1A, and replace __SET_ME__ in:
+          CONFIRM_RESTORE_VM
+          SMB_MOUNT_POINT
+        Nothing has been read, written or deleted.
+```
+
+Twelve lines in total across the five scripts. On this fleet:
+
+| Script           | PART 1A                                                      |
+| ---------------- | ------------------------------------------------------------ |
+| `final.sh`       | `CONFIRM_RESTORE_VM=1`, `SMB_MOUNT_POINT="/livestorage"`      |
+| `restore_vm.sh`  | `MYSQL_USER`, `MYSQL_PASSWORD`, `SMB_MOUNT_POINT="/livestorage"` |
+| `logical.sh`     | `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_HOST=""`, `SMB_MOUNT_POINT="/livestorage"` |
+| `backup_sync.sh` | `SOURCE_MOUNT_POINT="/livestorage"`, `DEST_MOUNT_POINT="/southstorage"` |
+| `db_cleanup.sh`  | `SMB_MOUNT_POINT="/livestorage"`                              |
+
+Nothing else in PART 1 has to be touched to deploy. §11 covers the rest.
+
+### First run
+
+In this order:
 
 ```bash
 # 1. Prove the pipeline can read everything, without touching a datadir.
 #    Verifies each archive's checksum, previews the binlogs, skips the dumps,
 #    and runs sync and cleanup in their own dry-run modes.
-/Data/script/final.sh --config=/Data/script/servers.json --dry-run
+/Data/script/final.sh --dry-run
 
 # 2. One server, by hand, no binlogs, no shutdown. This is the run that first
 #    executes the destructive path.
@@ -747,11 +778,15 @@ Then, in this order:
 /Data/script/db_cleanup.sh --dry-run
 
 # 4. The whole thing, still without the shutdown.
-/Data/script/final.sh --config=/Data/script/servers.json --no-shutdown
+/Data/script/final.sh --no-shutdown
 
 # 5. Nightly.
-#    30 2 * * *  /Data/script/final.sh --config=/Data/script/servers.json >/dev/null 2>&1
+#    30 2 * * *  /Data/script/final.sh >/dev/null 2>&1
 ```
+
+`final.sh` takes no arguments in normal use: the server list comes from
+`CONFIG_FILE` in its PART 1C, which defaults to `/Data/script/servers.json`.
+`--config=PATH` still overrides it, for a second list or a test run.
 
 `restore.sh` in this directory has still never been run end to end, and
 `restore_vm.sh` is derived from it — step 2 above is where that changes. Take a
@@ -776,3 +811,125 @@ grep -h ' RESULT ' /livestorage/final/pipeline_logs/*/pipeline.log | tail -20
 The pipeline log contains every child's output as well, so it is the only file
 that has to be read after a failure. Per-step logs stay where the child put
 them: `<backup_base>/logs/<id>/restore_<stamp>/` and `<base_dir>/logs/<run id>/`.
+
+---
+
+## 11. Configuration reference
+
+Settings live in three places, and the split is deliberate:
+
+| Where               | What                                                   | Changes when |
+| ------------------- | ------------------------------------------------------ | ------------ |
+| `servers.json`      | per **server**: which trees, which retention           | a server is added or removed |
+| PART 1A of a script | per **VM**: credentials, mount points, the wipe switch | the deployment moves to a new host |
+| PART 1B / 1C        | tuning, and constants shared between the scripts       | rarely, and deliberately |
+
+Nothing else is configuration. Binaries, the datadir and the systemd unit are
+asked for at run time, and per-run choices arrive as arguments.
+
+### The PART 1 tiers
+
+Every script's PART 1 is split into the same blocks:
+
+| Tier | Heading      | Rule |
+| ---- | ------------ | ---- |
+| 1A   | SET PER VM   | Ships as `__SET_ME__`. The script refuses to start while any is untouched. |
+| 1B   | TUNING       | Working defaults. Change for a measured reason. |
+| 1C   | SHARED       | The other scripts on this host assume these values. Change in all of them, or none. |
+| 1D   | NOT SET HERE | Detected at run time, or passed as arguments. Nothing to fill in. |
+| 1E   | GUARD        | The check itself. |
+
+The guard runs before the log engine starts, before the lock is taken and
+before the share is touched, so a misconfigured copy costs a second and changes
+nothing. That matters because the alternative is silent: a script carrying
+another host's values runs perfectly and does the wrong thing, and on this
+pipeline the wrong thing is a wiped datadir.
+
+### 1A — the per-VM values
+
+| Setting | In | What it is | What a copied value does |
+| --- | --- | --- | --- |
+| `CONFIRM_RESTORE_VM` | `final.sh` | `1` on the dedicated restore VM, `0` everywhere else | `1` on a production host erases that host's datadir once per server in `servers.json`, nightly, unattended |
+| `MYSQL_USER`, `MYSQL_PASSWORD` | `restore_vm.sh`, `logical.sh` | the local account | fails loudly at the connection check |
+| `MYSQL_HOST` | `logical.sh` | the instance to dump — the LOCAL restored one. `""` selects the local socket | an address copied from another VM turns the dump into read load on live production data, which is the one thing this VM exists to avoid |
+| `SMB_MOUNT_POINT` | `final.sh`, `restore_vm.sh`, `logical.sh`, `db_cleanup.sh` | the CIFS mount point itself, not a directory beneath it | `mountpoint -q` is true only for the exact mount path. Wrong here and the "is the share really mounted" check never fires, so a dropped share reads as an empty local directory and the run writes to the root filesystem |
+| `SOURCE_MOUNT_POINT`, `DEST_MOUNT_POINT` | `backup_sync.sh` | the two shares | as above, once per share. They should be different filers — the script verifies each is mounted and that the JSON paths sit under the right one, but it cannot tell two mounts of one filer apart |
+
+`CONFIRM_RESTORE_VM` is why the guard exists. Every other mistake in this table
+is recoverable; that one is an outage repeated until somebody notices.
+
+### 1B — tuning
+
+| Setting | Script | Default | Notes |
+| --- | --- | --- | --- |
+| `CONFIRM_WIPE` | `restore_vm.sh` | `1` | `0` disables restores on this host entirely |
+| `PARALLEL_THREADS` | `restore_vm.sh` | blank | xbstream extract and `--decompress`. Left blank it is half the cores of whatever VM it lands on; fill in a number to pin it |
+| `PREPARE_USE_MEMORY` | `restore_vm.sh` | `1G` | xtrabackup's own default is 100MB, which makes the redo apply crawl |
+| `DATADIR_SPACE_PCT` | `restore_vm.sh` | `120` | space requirement, % of the source datadir |
+| `ARCHIVE_EXPANSION_FACTOR` | `restore_vm.sh` | `5` | fallback when the manifest carries no `datadir_bytes` |
+| `STAGE_ARCHIVE` | `restore_vm.sh` | `1` | copy the archive to local disk before the wipe; `0` extracts straight off the share |
+| `ARCHIVE_STAGE_DIR` | `restore_vm.sh` | `/Data/dbvault-stage` | where the staged `.xbstream` lives |
+| `KEEP_STAGED_ON_FAILURE` | `restore_vm.sh` | `1` | a retry then skips the copy |
+| `XBSTREAM_DECOMPRESS` | `restore_vm.sh` | `0` | one-pass extract. Verify the build first: `xbstream --help` and look for `decompress` |
+| `MYSQL_READY_TIMEOUT`, `MYSQL_READY_INTERVAL` | `restore_vm.sh` | `900`, `2` | how long to wait for the restored server to accept a connection |
+| `PARALLEL` | `logical.sh` | `3` | databases dumped at once. NOT derived from the core count — this is load on the MySQL instance, not CPU work on this box |
+| `BACKUP_MODE`, `DB_LIST_DIR` | `logical.sh` | `ALL`, empty | `--mode=` and `--db_list_dir=` override per run |
+| `SOURCE_CHECK` | `logical.sh` | `1` | refuse to dump when the newest restore marker names a different server |
+| `DUMP_OPTS` | `logical.sh` | — | `--hex-blob` is deliberately absent: no binary columns in these schemas |
+| `SYNC_LOG_BASE`, `DEST_LOG_DAYS` | `backup_sync.sh` | — | keep the log base under `DEST_MOUNT_POINT`; the point is that the logs survive losing the source |
+| `DEST_RETENTION_DAYS` | `backup_sync.sh` | `3` | destination retention. `0` would delete a copy the moment it was made, so pre-flight refuses it |
+| `SMART_DAILY_DAYS`, `SMART_WEEKLY_KEEP` | `db_cleanup.sh` | `7`, `3` | what `"smart"` means: full daily coverage, then one archive per week |
+| `ALWAYS_KEEP_NEWEST` | `db_cleanup.sh` | `1` | never delete a database's last archive or a server's last physical set, however old |
+| `CLEANUP_LOG_BASE`, `KEEP_CLEANUP_LOG_DAYS` | `db_cleanup.sh` | — | this script's own logs |
+| `PIPELINE_LOG_BASE` | `final.sh` | — | one directory per pipeline run |
+| `SHUTDOWN_DELAY_MIN`, `SHUTDOWN_ON_FAILURE` | `final.sh` | `10`, `1` | shut down even after a failure: every log is on the share by then, so nothing on the VM is left to read |
+| `KEEP_LOCAL_DAYS` | all five | `14` | prunes logs stranded on the VM by a dead share |
+
+### 1C — shared between the scripts
+
+| Setting | Value | Why it has to match |
+| --- | --- | --- |
+| `CONFIG_FILE` | `/Data/script/servers.json` | `final.sh`, `backup_sync.sh` and `db_cleanup.sh` each default to it. `final.sh` passes its own value down with `--config=`, so a pipeline run stays consistent even if a child's default was edited |
+| `LOCAL_STAGE` | `/Data/dbvault-stage` | logs and staging during a run |
+| `LOCK_DIR` | `/var/lock/dbvault` | `final.sh` holds the pipeline lock; each child takes its own beside it |
+| `STATE_DIR` | `/var/lib/dbvault` | the restore marker. `restore_vm.sh` writes it, `logical.sh` reads it for the source check — different values there and the check silently never matches |
+| `NON_DB_DIRS` | `logs manifests cleanup_logs` | directories in a dump tree that are not databases. `backup_sync.sh` and `db_cleanup.sh` must agree, or one copies what the other expires |
+| `ARCHIVE_GLOB` | `*.tar.gz` | what a logical archive looks like |
+| `PHYSICAL_GLOB`, `PHYS_SET_SUFFIXES`, `PHYS_SET_DIRS` | — | `db_cleanup.sh` only: what a complete physical set is, so expiring one takes the archive, its checksum, its manifest, its binlogs and its logs together |
+| `BINLOG_PREFIX` | `binlog` | the **producing** host's `log_bin` basename, which is what names the binlog files sitting on the share. Not this host's — this host's datadir is about to be erased, and its own naming is irrelevant to the chain being applied |
+
+### 1D — not set anywhere
+
+Resolved at run time. Each still honours an environment variable, for the rare
+host where the detected answer is wrong.
+
+| Value | How it is found | Override |
+| --- | --- | --- |
+| `MYSQL_DATADIR` | `SELECT @@datadir` from the running server, then `my_print_defaults mysqld` when it is down | `MYSQL_DATADIR=/srv/mysql ./restore_vm.sh ...` |
+| `MYSQL_SERVICE` | the first of `mysql`, `mysqld`, `mariadb` that `systemctl cat` knows | `MYSQL_SERVICE=mysqld ./restore_vm.sh ...` |
+| `MYSQL_BIN`, `MYSQLDUMP_BIN`, `XTRABACKUP_BIN`, `XBSTREAM_BIN`, `MYSQLADMIN_BIN`, `MYSQLBINLOG_BIN` | `command -v` | `MYSQLDUMP_BIN=/opt/mysql/bin/mysqldump ./logical.sh ...` |
+| `RESTORE_SCRIPT`, `LOGICAL_SCRIPT`, `SYNC_SCRIPT`, `CLEANUP_SCRIPT` | beside `final.sh`, via `SCRIPT_DIR` | `RESTORE_SCRIPT=/Data/script/restore_vm.sh.known-good ./final.sh` |
+| `SERVER_NAME`, `SECONDARY_STORAGE_DIR` | `--server_name=`, `--backup_base=` | — |
+| `BASE_DIR` | `--base_dir=` | — |
+
+The datadir is the one worth understanding. `restore_vm.sh` **erases** it, on
+every run. Asking the server where it is beats a path typed into a file that was
+copied from another host; and when the server is down, `my_print_defaults` reads
+the same `my.cnf` that `mysqld` itself would read, so a VM whose MySQL has never
+started still resolves correctly. If neither answers, the script stops rather
+than guessing at a directory it is about to delete.
+
+Both the value and where it came from are printed in the run header:
+
+```
+ datadir         : /Data/mysql  (@@datadir)
+```
+
+### Checking a deployment
+
+`--dry-run` resolves everything, prints the header and the full pre-flight, and
+touches nothing. It is the fastest way to see what a host will actually use:
+
+```bash
+/Data/script/final.sh --dry-run
+```

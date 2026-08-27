@@ -3,36 +3,48 @@
     "server_name": "Cloud-Live-DB-Default",
     "backup_base": "/livestorage/Backup/Cloud-Live-DB-Default/percona",
     "base_dir": "/livestorage/Backup/Cloud-Live-DB-Default",
-    "sync_dest": "/southstorage/backup_latest/Cloud-Live-DB-Default"
+    "sync_dest": "/southstorage/backup_latest/Cloud-Live-DB-Default",
+    "retention": "days:30",
+    "physical_retention": "days:10"
   },
   {
     "server_name": "Cloud-Live-DB-Tirupati",
     "backup_base": "/livestorage/Backup/Cloud-Live-DB-Tirupati/percona",
     "base_dir": "/livestorage/Backup/Cloud-Live-DB-Tirupati",
-    "sync_dest": "/southstorage/backup_latest/Cloud-Live-DB-Tirupati"
+    "sync_dest": "/southstorage/backup_latest/Cloud-Live-DB-Tirupati",
+    "retention": "days:30",
+    "physical_retention": "days:10"
   },
   {
     "server_name": "Cloud-Live-DB-4th-Server",
     "backup_base": "/livestorage/Backup/Cloud-Live-DB-4th-Server/percona",
     "base_dir": "/livestorage/Backup/Cloud-Live-DB-4th-Server",
-    "sync_dest": "/southstorage/backup_latest/Cloud-Live-DB-4th-Server"
+    "sync_dest": "/southstorage/backup_latest/Cloud-Live-DB-4th-Server",
+    "retention": "days:30",
+    "physical_retention": "days:10"
   },
   {
     "server_name": "GSP-Cloud-Live-DB",
     "backup_base": "/livestorage/Backup/GSP-Cloud-Live-DB/percona",
     "base_dir": "/livestorage/Backup/GSP-Cloud-Live-DB",
-    "sync_dest": "/southstorage/backup_latest/GSP-Cloud-Live-DB"
+    "sync_dest": "/southstorage/backup_latest/GSP-Cloud-Live-DB",
+    "retention": "days:30",
+    "physical_retention": "days:10"
   },
   {
     "server_name": "DKT-EInvoice-Live-Hub-DB",
     "backup_base": "/livestorage/Backup/DKT-EInvoice-Live-Hub-DB/percona",
     "base_dir": "/livestorage/Backup/DKT-EInvoice-Live-Hub-DB",
-    "sync_dest": "/southstorage/backup_latest/DKT-EInvoice-Live-Hub-DB"
+    "sync_dest": "/southstorage/backup_latest/DKT-EInvoice-Live-Hub-DB",
+    "retention": "days:30",
+    "physical_retention": "days:10"
   },
   {
     "server_name": "DKT-EInvoice-Live-Log-DB",
     "backup_base": "/livestorage/Backup/DKT-EInvoice-Live-Log-DB/percona",
     "base_dir": "/livestorage/Backup/DKT-EInvoice-Live-Log-DB",
-    "sync_dest": "/southstorage/backup_latest/DKT-EInvoice-Live-Log-DB"
+    "sync_dest": "/southstorage/backup_latest/DKT-EInvoice-Live-Log-DB",
+    "retention": "days:30",
+    "physical_retention": "days:10"
   }
 ]

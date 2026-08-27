@@ -6,7 +6,7 @@
 # binlog from that position forward. Runs every 15 minutes from cron.
 # Docs: stream-scripts/physical/README.md
 #
-#   PART 1   configuration
+#   PART 1   configuration        1A set per VM / 1B tune / 1C shared
 #   PART 2   log engine
 #   PART 3   failure handling
 #   PART 4   probes
@@ -25,21 +25,56 @@ set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 1  CONFIGURATION
+#
+#   1A  SET PER VM    __SET_ME__ until filled in; the script refuses to start
+#   1B  TUNING        working defaults
+#   1C  SHARED        must match the other scripts on this host
+#   1D  NOT SET HERE  detected at run time, or passed as arguments
+#
+# What each one means, and what breaks when it is wrong: docs/README.md §11
 # ═══════════════════════════════════════════════════════════════════════════
 
-MYSQL_USER="Admin"
-MYSQL_PASSWORD=""
+# ── 1A  SET PER VM ─────────────────────────────────────────────────────────
+MYSQL_USER="__SET_ME__"                              # needs RELOAD, REPLICATION CLIENT
+MYSQL_PASSWORD="__SET_ME__"
+SECONDARY_STORAGE_DIR="__SET_ME__"                   # MUST equal backup.sh's, byte for byte
+SMB_MOUNT_POINT="__SET_ME__"                         # MUST equal backup.sh's
 
-SECONDARY_STORAGE_DIR="/livestorage/YK/Restore-VM"   # MUST match backup.sh
-SMB_MOUNT_POINT="/livestorage"                       # MUST match backup.sh
+# ── 1B  TUNING ─────────────────────────────────────────────────────────────
+LOCK_STALE_SECONDS=21600                             # 6h; past this, assume backup.sh crashed
 
-BINLOG_BASE="/Data/mysql/binlog"                     # log_bin basename
-MYSQL_BIN="/usr/bin/mysql"
-MYSQLBINLOG_BIN="/usr/bin/mysqlbinlog"
-
+# ── 1C  SHARED ─────────────────────────────────────────────────────────────
 LOCK_DIR="/var/lock/dbvault"                         # MUST match backup.sh
-BACKUP_BASE_NAME="dbvault-stage"                     # basename of BACKUP_BASE
-LOCK_STALE_SECONDS=21600                             # past this, assume a crash
+BACKUP_BASE_NAME="dbvault-stage"                     # basename of backup.sh's BACKUP_BASE
+
+# ── 1D  NOT SET HERE ───────────────────────────────────────────────────────
+# Binaries resolved at the end of PART 4, the binlog path at the top of PART 8.
+# An env var still wins.
+BINLOG_BASE="${BINLOG_BASE:-}"                       # SELECT @@log_bin_basename
+MYSQL_BIN="${MYSQL_BIN:-}"                           # PATH
+MYSQLBINLOG_BIN="${MYSQLBINLOG_BIN:-}"               # PATH
+
+# ── 1E  GUARD ──────────────────────────────────────────────────────────────
+# Refuses to start while any 1A value is still __SET_ME__.
+
+SET_ME_VARS=(MYSQL_USER MYSQL_PASSWORD SECONDARY_STORAGE_DIR SMB_MOUNT_POINT)
+
+check_set_me() {
+  local v
+  local -a missing=()
+  for v in "${SET_ME_VARS[@]}"; do
+    if [[ "${!v}" == "__SET_ME__" ]]; then missing+=("$v"); fi
+  done
+  if (( ${#missing[@]} == 0 )); then return 0; fi
+  {
+    printf '[ERROR] %s has not been configured for this host.\n' "${BASH_SOURCE[0]##*/}"
+    printf '        Open it, find PART 1A, and replace __SET_ME__ in:\n'
+    printf '          %s\n' "${missing[@]}"
+    printf '        Nothing has been read, written or deleted.\n'
+  } >&2
+  exit 1
+}
+check_set_me
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 2  LOG ENGINE
@@ -193,6 +228,23 @@ trap 'INTERRUPTED=1; fail_run' INT TERM
 free_gb() { df -BG "$1" | awk 'NR==2 {print $4}' | sed 's/G//'; }
 mysql_q() { "$MYSQL_BIN" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -NBe "$1" 2>/dev/null; }
 
+# PART 1D: looked up in PATH, unless the environment named one.
+resolve_bin() {
+  local var="$1" name="$2"
+  local path="${!var}"
+  if [[ -n "$path" ]]; then
+    if [[ -x "$path" ]]; then return 0; fi
+    echo "[ERROR] $var is set to '$path', which is not an executable file." >&2
+    exit 1
+  fi
+  path="$(command -v "$name" 2>/dev/null || true)"
+  if [[ -z "$path" ]]; then
+    echo "[ERROR] '$name' is not in PATH — install it, or run with $var=/full/path/to/$name" >&2
+    exit 1
+  fi
+  printf -v "$var" '%s' "$path"
+}
+
 writable() {
   local probe="$1/.probe_$$"
   touch "$probe" 2>/dev/null || return 1
@@ -224,6 +276,9 @@ seq_of() {
   s="${s#"${s%%[!0]*}"}"
   printf '%s' "${s:-0}"
 }
+
+resolve_bin MYSQL_BIN       mysql
+resolve_bin MYSQLBINLOG_BIN mysqlbinlog
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 5  SHARE REACHABILITY
@@ -322,6 +377,23 @@ LOG_DIR="${SECONDARY_STORAGE_DIR}/logs/${ANCHOR_BASE}/collect"
 RUN_LOG="${LOG_DIR}/collect.log"
 ERROR_LOG="${LOG_DIR}/collect_errors.log"
 
+# PART 1D: a stale path finds an empty directory, copies nothing, and reports
+# a clean run — the worst failure available to this script.
+if [[ -z "$BINLOG_BASE" ]]; then
+  BINLOG_BASE="$(mysql_q 'SELECT @@log_bin_basename' || true)"
+  BINLOG_SOURCE="@@log_bin_basename"
+  if [[ -z "$BINLOG_BASE" ]]; then
+    {
+      echo "[ERROR] could not read @@log_bin_basename from MySQL."
+      echo "        MySQL may be down, or binary logging may be off."
+      echo "        To override: BINLOG_BASE=/path/to/binlog $0"
+    } >&2
+    exit 1
+  fi
+else
+  BINLOG_SOURCE="environment"
+fi
+
 BINLOG_DIR="$(dirname "$BINLOG_BASE")"
 BINLOG_PREFIX="$(basename "$BINLOG_BASE")"
 BINLOG_GLOB="${BINLOG_PREFIX}.[0-9][0-9][0-9][0-9][0-9][0-9]"
@@ -346,7 +418,7 @@ banner " COLLECT RUN  anchor $ANCHOR_BASE"
 kv "started"     "$(date '+%F %T %Z')"
 kv "host"        "$(hostname -s 2>/dev/null || echo unknown)"
 kv "anchor file" "$ANCHOR_FILE"
-kv "source"      "$BINLOG_DIR"
+kv "source"      "$BINLOG_DIR  ($BINLOG_SOURCE)"
 kv "destination" "$TARGET_DIR"
 sub
 

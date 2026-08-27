@@ -5,7 +5,7 @@
 # ERASES MYSQL_DATADIR. Take a VM snapshot first.
 # Docs: stream-scripts/physical/README.md
 #
-#   PART 1   configuration
+#   PART 1   configuration        1A set per VM / 1B tune / 1C shared
 #   PART 2   log engine
 #   PART 3   failure handling
 #   PART 4   probes
@@ -27,72 +27,82 @@ set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 1  CONFIGURATION
+#
+#   1A  SET PER VM    __SET_ME__ until filled in; the script refuses to start
+#   1B  TUNING        working defaults
+#   1C  SHARED        must match the other scripts on this host
+#   1D  NOT SET HERE  detected at run time, or passed as arguments
+#
+# What each one means, and what breaks when it is wrong: docs/README.md §11
 # ═══════════════════════════════════════════════════════════════════════════
 
-MYSQL_USER="Admin"
-MYSQL_PASSWORD=""
+# ── 1A  SET PER VM ─────────────────────────────────────────────────────────
+MYSQL_USER="__SET_ME__"                              # probes and post-restore checks
+MYSQL_PASSWORD="__SET_ME__"
+SECONDARY_STORAGE_DIR="__SET_ME__"                   # which server to restore FROM — its backup.sh dir
+SMB_MOUNT_POINT="__SET_ME__"                         # the mount point itself, e.g. /livestorage
 
-SECONDARY_STORAGE_DIR="/livestorage/YK/Restore-VM"   # MUST match backup.sh
-SMB_MOUNT_POINT="/livestorage"                       # MUST match backup.sh
-
-LOCAL_STAGE="/Data/dbvault-stage"                    # logs, staged binlogs, staged archive
-MYSQL_DATADIR="/Data/mysql"                          # ERASED by this script
-
-# Local logs and previews left behind when the share was unreachable are pruned
-# after this many days. Published logs are moved, not copied, so nothing else
-# accumulates here.
-KEEP_LOCAL_DAYS=14
-
+# ── 1B  TUNING ─────────────────────────────────────────────────────────────
 CONFIRM_WIPE=1                                       # 0 = refuse to run at all
+KEEP_LOCAL_DAYS=14                                   # prune logs stranded here
 
 DATADIR_SPACE_PCT=120                                # need, % of source datadir
 ARCHIVE_EXPANSION_FACTOR=5                           # fallback: x compressed size
 
-PARALLEL_THREADS=8                                   # xbstream and --decompress
+PARALLEL_THREADS=""                                  # xbstream and --decompress; blank = half the cores
 PREPARE_USE_MEMORY="1G"                              # empty = do not pass it
 
-# The archive is COPIED to local disk before the wipe, then extracted from
-# there. Two reasons, in order of importance:
-#   1. the network leaves the critical path. The wipe happens only once a
-#      verified local copy exists, so a share that drops costs a retry rather
-#      than a half-populated datadir.
-#   2. it is much faster. xbstream reads its stdin serially in small chunks and
-#      interleaves thousands of file creations; over SMB every one of those pays
-#      link latency. Measured on a 14GiB archive: 71 MiB/s for a flat read of
-#      the same file off the same share, 17 MiB/s for xbstream reading it.
-# Set to 0 to extract straight off the share (the old behaviour).
-STAGE_ARCHIVE=1
+STAGE_ARCHIVE=1                                      # copy the archive local before the wipe
 ARCHIVE_STAGE_DIR="/Data/dbvault-stage"              # staged .xbstream lives here
 KEEP_STAGED_ON_FAILURE=1                             # 1 = a retry skips the copy
 
-# Fold the decompress into the extract: xbstream writes the datadir already
-# expanded, so the .zst files are never created and never read back. Saves a
-# 1x-compressed write plus a 1x-compressed read, and removes the leftover-.zst
-# hazard entirely rather than checking for it afterwards.
-# 0 until verified on this host: not every xtrabackup build has it, and a build
-# without zstd support fails the same way the two-pass path does.
-#   check with:  xbstream --help | grep -i decompress
-XBSTREAM_DECOMPRESS=0
+# 0 until verified here:  xbstream --help | grep -i decompress
+XBSTREAM_DECOMPRESS=0                                # 1 = extract and decompress in one pass
 
-# The old value was a hardcoded 60 x 2s. A freshly restored multi-terabyte
-# datadir can spend well over two minutes opening tablespaces before it accepts
-# a connection, and the wait is cheap compared to redoing the restore.
-MYSQL_READY_TIMEOUT=900                              # seconds
+MYSQL_READY_TIMEOUT=900                              # seconds to wait for the restored server
 MYSQL_READY_INTERVAL=2
 
-BINLOG_PREFIX="binlog"                               # log_bin basename
+# ── 1C  SHARED ─────────────────────────────────────────────────────────────
+LOCAL_STAGE="/Data/dbvault-stage"                    # logs, staged binlogs, staged archive
+LOCK_DIR="/var/lock/dbvault"                         # tmpfs; cleared by reboot
+STATE_DIR="/var/lib/dbvault"                         # restore marker, persistent
+
+BINLOG_PREFIX="binlog"                               # the SOURCE host's log_bin basename
 BINLOG_GLOB="${BINLOG_PREFIX}.[0-9][0-9][0-9][0-9][0-9][0-9]"
 BINLOG_FILE_START_POS=4                              # past the 4-byte magic
 
-XTRABACKUP_BIN="/usr/bin/xtrabackup"
-XBSTREAM_BIN="/usr/bin/xbstream"
-MYSQL_BIN="/usr/bin/mysql"
-MYSQLADMIN_BIN="/usr/bin/mysqladmin"
-MYSQLBINLOG_BIN="/usr/bin/mysqlbinlog"
-MYSQL_SERVICE="mysql"
+# ── 1D  NOT SET HERE ───────────────────────────────────────────────────────
+# Resolved at the end of PART 4. An env var still wins.
+MYSQL_DATADIR="${MYSQL_DATADIR:-}"                   # @@datadir, then my.cnf — ERASED by this script
+MYSQL_SERVICE="${MYSQL_SERVICE:-}"                   # the systemd unit to stop and start
 
-LOCK_DIR="/var/lock/dbvault"                         # tmpfs; cleared by reboot
-STATE_DIR="/var/lib/dbvault"                         # restore marker, persistent
+XTRABACKUP_BIN="${XTRABACKUP_BIN:-}"                 # PATH
+XBSTREAM_BIN="${XBSTREAM_BIN:-}"                     # PATH
+MYSQL_BIN="${MYSQL_BIN:-}"                           # PATH
+MYSQLADMIN_BIN="${MYSQLADMIN_BIN:-}"                 # PATH
+MYSQLBINLOG_BIN="${MYSQLBINLOG_BIN:-}"               # PATH
+
+# ── 1E  GUARD ──────────────────────────────────────────────────────────────
+# Refuses to start while any 1A value is still __SET_ME__.
+
+SET_ME_VARS=(MYSQL_USER MYSQL_PASSWORD SECONDARY_STORAGE_DIR SMB_MOUNT_POINT)
+
+check_set_me() {
+  local v
+  local -a missing=()
+  for v in "${SET_ME_VARS[@]}"; do
+    if [[ "${!v}" == "__SET_ME__" ]]; then missing+=("$v"); fi
+  done
+  if (( ${#missing[@]} == 0 )); then return 0; fi
+  {
+    printf '[ERROR] %s has not been configured for this host.\n' "${BASH_SOURCE[0]##*/}"
+    printf '        Open it, find PART 1A, and replace __SET_ME__ in:\n'
+    printf '          %s\n' "${missing[@]}"
+    printf '        Nothing has been read, written or deleted.\n'
+  } >&2
+  exit 1
+}
+check_set_me
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 2  LOG ENGINE
@@ -463,6 +473,92 @@ seq_of() {
   printf '%s' "${s:-0}"
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# PART 1D resolution. Order matters: the service name is needed by mysql_up,
+# which resolve_datadir consults.
+
+
+# PART 1B: empty (or 0) = half the cores. Fill the variable in to pin a number.
+auto_threads() {
+  local cores half
+  cores=$(nproc 2>/dev/null || echo 0)
+  if (( cores < 1 )); then cores=2; fi
+  half=$(( cores / 2 ))
+  if (( half < 1 )); then half=1; fi
+  printf '%s' "$half"
+}
+# PART 1D: looked up in PATH, unless the environment named one.
+resolve_bin() {
+  local var="$1" name="$2"
+  local path="${!var}"
+  if [[ -n "$path" ]]; then
+    if [[ -x "$path" ]]; then return 0; fi
+    echo "[ERROR] $var is set to '$path', which is not an executable file." >&2
+    exit 1
+  fi
+  path="$(command -v "$name" 2>/dev/null || true)"
+  if [[ -z "$path" ]]; then
+    echo "[ERROR] '$name' is not in PATH — install it, or run with $var=/full/path/to/$name" >&2
+    exit 1
+  fi
+  printf -v "$var" '%s' "$path"
+}
+
+# mysql, mysqld or mariadb — distributions disagree.
+resolve_service() {
+  local s
+  if [[ -n "$MYSQL_SERVICE" ]]; then return 0; fi
+  for s in mysql mysqld mariadb; do
+    if systemctl cat "$s.service" >/dev/null 2>&1; then MYSQL_SERVICE="$s"; return 0; fi
+  done
+  {
+    echo "[ERROR] no mysql, mysqld or mariadb systemd unit found on this host."
+    echo "        This script has to stop and start MySQL, so it cannot continue."
+    echo "        To name it explicitly: MYSQL_SERVICE=<unit> $0 ..."
+  } >&2
+  exit 1
+}
+
+# THE DIRECTORY THIS SCRIPT ERASES. The running server first; my.cnf when it
+# is down, so a VM whose MySQL never started still resolves.
+resolve_datadir() {
+  local d=""
+  if [[ -n "$MYSQL_DATADIR" ]]; then
+    DATADIR_SOURCE="environment"
+    MYSQL_DATADIR="${MYSQL_DATADIR%/}"
+    return 0
+  fi
+  if mysql_up; then
+    d="$(mysql_q 'SELECT @@datadir' || true)"
+    if [[ -n "$d" ]]; then DATADIR_SOURCE="@@datadir"; fi
+  fi
+  if [[ -z "$d" ]] && command -v my_print_defaults >/dev/null 2>&1; then
+    d="$(my_print_defaults mysqld 2>/dev/null | sed -n 's/^--datadir=//p' | tail -1)"
+    if [[ -n "$d" ]]; then DATADIR_SOURCE="my.cnf"; fi
+  fi
+  d="${d%/}"
+  if [[ -z "$d" ]]; then
+    {
+      echo "[ERROR] cannot determine the MySQL datadir."
+      echo "        The server is not answering, and my_print_defaults reported no"
+      echo "        --datadir. This script will not guess at a directory it erases."
+      echo "        To name it explicitly: MYSQL_DATADIR=/path/to/datadir $0 ..."
+    } >&2
+    exit 1
+  fi
+  MYSQL_DATADIR="$d"
+}
+
+resolve_bin XTRABACKUP_BIN  xtrabackup
+resolve_bin XBSTREAM_BIN    xbstream
+resolve_bin MYSQL_BIN       mysql
+resolve_bin MYSQLADMIN_BIN  mysqladmin
+resolve_bin MYSQLBINLOG_BIN mysqlbinlog
+resolve_service
+resolve_datadir
+
+if [[ -z "$PARALLEL_THREADS" || "$PARALLEL_THREADS" == "0" ]]; then PARALLEL_THREADS="$(auto_threads)"; fi
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 5  USAGE AND ARGUMENTS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -598,7 +694,7 @@ kv "host"     "$(hostname -s 2>/dev/null || echo unknown)"
 kv "mode"     "$RUN_MODE"
 kv "attempt"  "$RUN_STAMP"
 kv "archive"  "$SMB_ARCHIVE"
-kv "datadir"  "$MYSQL_DATADIR"
+kv "datadir"  "$MYSQL_DATADIR  ($DATADIR_SOURCE)"
 kv "from"     "${FROM_BINLOG:-(none, using the backup anchor)}"
 kv "marker"   "$RESTORE_MARKER"
 kv "logs"     "$LOCAL_STAGE during the run, moved to the share at the end"
