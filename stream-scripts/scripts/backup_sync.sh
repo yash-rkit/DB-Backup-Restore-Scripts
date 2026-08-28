@@ -56,7 +56,7 @@ CONFIG_FILE="/Data/script/servers.json"              # the server list; --config
 LOCAL_STAGE="/Data/dbvault-stage"                    # logs only, during the run
 LOCK_DIR="/var/lock/dbvault"
 ARCHIVE_GLOB="*.tar.gz"
-NON_DB_DIRS="logs manifests cleanup_logs"            # dirs in a dump tree that are not databases
+NON_DB_DIRS="logs manifests cleanup_logs restart-logs meta"  # dirs in a dump tree that are not databases
 
 # ── 1D  NOT SET HERE ───────────────────────────────────────────────────────
 DRY_RUN=0                                            # --dry-run

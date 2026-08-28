@@ -73,7 +73,7 @@ ARCHIVE_GLOB="*.tar.gz"                              # finds a logical set
 PHYSICAL_GLOB="*.xbstream"                           # finds a physical set
 PHYS_SET_SUFFIXES=".xbstream .sha256 .manifest _binlog_info"
 PHYS_SET_DIRS="binlog meta logs"
-NON_DB_DIRS="logs manifests cleanup_logs"            # dirs in a dump tree that are not databases
+NON_DB_DIRS="logs manifests cleanup_logs restart-logs meta"  # dirs in a dump tree that are not databases
 
 # ── 1D  NOT SET HERE ───────────────────────────────────────────────────────
 DRY_RUN=0                                            # --dry-run
