@@ -46,6 +46,8 @@ BACKUP_MODE="ALL"                                    # ALL or SELECTED; --mode= 
 DB_LIST_DIR=""                                       # SELECTED: dir of .txt/.csv/.lst
 PARALLEL=3                                           # databases dumped at once
 SOURCE_CHECK=1                                       # refuse if the newest marker is another server
+DUMP_ATTEMPTS=3                                      # tries per database, on a lock error only
+DUMP_RETRY_WAIT=5                                    # seconds between those tries
 
 # --hex-blob is deliberately NOT set: no binary columns in these schemas.
 DUMP_OPTS="--single-transaction --quick --routines --events --triggers \
@@ -315,6 +317,12 @@ mysql_args() {
   return 0
 }
 
+# 1213 deadlock, 1205 lock wait timeout. Both clear on their own, and both are
+# worth another try; every other mysqldump error is not.
+is_lock_error() {
+  grep -qE '\((1213|1205)\)|Deadlock found|Lock wait timeout exceeded' "$1" 2>/dev/null
+}
+
 # stderr goes to the error log, not /dev/null: an empty result must be
 # distinguishable from a failed connection.
 mysql_q() {
@@ -421,6 +429,11 @@ esac
 
 [[ "$PARALLEL" =~ ^[1-9][0-9]*$ ]] \
   || argfail "PARALLEL must be a positive integer, got '$PARALLEL'"
+
+[[ "$DUMP_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] \
+  || argfail "DUMP_ATTEMPTS must be a positive integer, got '$DUMP_ATTEMPTS'"
+[[ "$DUMP_RETRY_WAIT" =~ ^[0-9]+$ ]] \
+  || argfail "DUMP_RETRY_WAIT must be a non-negative integer, got '$DUMP_RETRY_WAIT'"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 6  SINGLE-INSTANCE LOCK
@@ -755,19 +768,35 @@ dump_one() {
   printf 'fail killed\n' > "$STATUS"
 
   # Steps 1-4 are entirely local. Only step 5 touches the network.
-  # 1. dump
-  # shellcheck disable=SC2086  # DUMP_OPTS is a deliberate word-split option list
-  if ! nice -n 19 ionice -c2 -n7 \
-       "$MYSQLDUMP_BIN" "${a[@]}" $DUMP_OPTS $SOURCE_DATA_OPT \
-       --databases "$DB" > "$SQL" 2>"$ERR"; then
-    local reason
+  # 1. dump. A lock error is retried; every other error fails on the first try.
+  local attempt=1
+  local reason=""
+  while :; do
+    # shellcheck disable=SC2086  # DUMP_OPTS is a deliberate word-split option list
+    if nice -n 19 ionice -c2 -n7 \
+         "$MYSQLDUMP_BIN" "${a[@]}" $DUMP_OPTS $SOURCE_DATA_OPT \
+         --databases "$DB" > "$SQL" 2>"$ERR"; then
+      break
+    fi
+
     reason="$(grep -v '\[Warning\].*password' "$ERR" 2>/dev/null | head -1 || true)"
-    erro "$(leader "$DB" 'DUMP FAILED')"
-    cerr "${reason:-unknown error}"
-    rm -f "$ERR" "$SQL" 2>/dev/null || true
-    printf 'fail mysqldump\n' > "$STATUS"
-    return 0
-  fi
+    rm -f "$SQL" 2>/dev/null || true          # a partial dump is never retried into
+
+    if ! is_lock_error "$ERR" || (( attempt >= DUMP_ATTEMPTS )); then
+      erro "$(leader "$DB" 'DUMP FAILED')"
+      cerr "${reason:-unknown error}"
+      (( attempt > 1 )) && cerr "gave up after ${attempt} lock retries"
+      rm -f "$ERR" 2>/dev/null || true
+      printf 'fail mysqldump\n' > "$STATUS"
+      return 0
+    fi
+
+    warn "$(leader "$DB" "LOCK RETRY ${attempt}/${DUMP_ATTEMPTS}")"
+    cont "${reason:-lock error}"
+    : > "${WORK_DIR}/${DB}.retried"           # the parent counts these
+    sleep "$DUMP_RETRY_WAIT"
+    attempt=$((attempt + 1))
+  done
   rm -f "$ERR" 2>/dev/null || true
 
   if [[ ! -s "$SQL" ]]; then
@@ -857,13 +886,19 @@ dump_one() {
   rm -f "$ARC" "${ARC}.sha256" 2>/dev/null || true
 
   printf 'ok %s\n' "$bytes" > "$STATUS"
-  info "$(leader "$DB" "$(hsize "$bytes")")"
+  if (( attempt > 1 )); then
+    info "$(leader "$DB" "$(hsize "$bytes")  (attempt ${attempt})")"
+  else
+    info "$(leader "$DB" "$(hsize "$bytes")")"
+  fi
   return 0
 }
 
 export -f dump_one emit emit_err info warn erro cont cerr leader tag hsize mysql_args
+export -f is_lock_error
 export BACKUP_DIR BUILD_DIR RUN_ID WORK_DIR RUN_LOG ERROR_LOG PHASE STEP LOG_DOTS
 export DUMP_OPTS SOURCE_DATA_OPT MYSQL_USER MYSQL_PASSWORD MYSQL_HOST MYSQLDUMP_BIN
+export DUMP_ATTEMPTS DUMP_RETRY_WAIT
 
 # -d '\n' so a database name is never split on whitespace. `|| true` because a
 # worker's exit status must not abort the run — each one records its own
@@ -872,6 +907,11 @@ printf '%s\n' "$DATABASES" | grep '[^[:space:]]' \
   | xargs -r -d '\n' -n1 -P "$PARALLEL" bash -c 'dump_one "$@"' _ || true
 
 DUMP_ELAPSED="$(elapsed "$PHASE_EPOCH")"
+
+# Workers cannot reach WARN_COUNT — they run in their own shells — so a retry
+# leaves a marker behind and is counted here instead.
+RETRIED_COUNT=$(find "$WORK_DIR" -maxdepth 1 -type f -name '*.retried' 2>/dev/null | wc -l)
+RETRIED_COUNT=${RETRIED_COUNT// /}
 
 while IFS= read -r db; do
   [[ -n "$db" ]] || continue
@@ -899,6 +939,8 @@ if [[ "$FAILED_COUNT" -gt 0 ]]; then
 else
   val "dumped" "$OK_COUNT/$DB_COUNT  $(hsize "$TOTAL_BYTES")  ($DUMP_ELAPSED)"
 fi
+[[ "$RETRIED_COUNT" -gt 0 ]] \
+  && cont "$RETRIED_COUNT database(s) hit a lock and were retried"
 
 [[ "$OK_COUNT" -gt 0 ]] \
   || die "$(leader 'dump' 'NOTHING PUBLISHED')" \
