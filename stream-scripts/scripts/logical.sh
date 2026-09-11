@@ -14,7 +14,7 @@
 #   PART 5   usage and arguments
 #   PART 6   single-instance lock
 #   PART 7   identity and paths
-#   PART 8   pre-flight            15 checks
+#   PART 8   pre-flight            12 checks
 #   PART 9   database list         step 1/4
 #   PART 10  dump                  step 2/4
 #   PART 11  verify                step 3/4
@@ -39,11 +39,10 @@ MYSQL_USER="__SET_ME__"                              # needs SELECT, LOCK TABLES
 MYSQL_PASSWORD="__SET_ME__"
 MYSQL_HOST="__SET_ME__"                              # the LOCAL restored instance; "" = local socket
 SMB_MOUNT_POINT="__SET_ME__"                         # the mount point itself, e.g. /livestorage
+EXTRA_MOUNTS=""                                      # other mounts that may hold server paths, space separated
 
 # ── 1B  TUNING ─────────────────────────────────────────────────────────────
 KEEP_LOCAL_DAYS=14                                   # prune logs stranded here
-BACKUP_MODE="ALL"                                    # ALL or SELECTED; --mode= overrides
-DB_LIST_DIR=""                                       # SELECTED: dir of .txt/.csv/.lst
 PARALLEL=3                                           # databases dumped at once
 SOURCE_CHECK=1                                       # refuse if the newest marker is another server
 DUMP_ATTEMPTS=3                                      # tries per database, on a lock error only
@@ -67,9 +66,16 @@ MYSQLDUMP_BIN="${MYSQLDUMP_BIN:-}"                   # PATH
 SERVER_NAME=""                                       # --server_name=
 BASE_DIR=""                                          # --base_dir=, this server's dump root
 
+# A servers.json entry may carry mysql_user / mysql_password for a server whose
+# credentials differ from this host's. final.sh exports them for the one child
+# it is running; unset, both fall through to the 1A values above. Environment
+# rather than an argument, so the password never reaches anyone's ps output.
+MYSQL_USER="${DBVAULT_MYSQL_USER:-$MYSQL_USER}"
+MYSQL_PASSWORD="${DBVAULT_MYSQL_PASSWORD:-$MYSQL_PASSWORD}"
+
 # ── 1E  GUARD ──────────────────────────────────────────────────────────────
-# Refuses to start while any 1A value is still __SET_ME__. Called in PART 5,
-# because --mysql_host= can supply one of them.
+# Refuses to start while any 1A value is still __SET_ME__. Called in PART 5, so
+# the servers.json credential override gets its chance first.
 
 SET_ME_VARS=(MYSQL_USER MYSQL_PASSWORD MYSQL_HOST SMB_MOUNT_POINT)
 
@@ -142,7 +148,7 @@ nok() { warn "$(leader "$1" "$2")"; }
 skp() { info "$(leader "$1" "$2")"; }
 
 CHECK_N=0
-CHECK_TOTAL=13
+CHECK_TOTAL=12
 PHASE_EPOCH=0
 
 phase() { PHASE="$1"; STEP="${2:--}"; PHASE_EPOCH="$(date +%s)"; }
@@ -176,7 +182,6 @@ TOTAL_BYTES=0
 VERIFIED=0
 PUBLISHED_LOGS=0
 WORK_DIR=""
-DB_LIST_FILE=""
 
 publish_logs() {
   [[ "$PUBLISHED_LOGS" == "1" ]] && return 0
@@ -309,6 +314,18 @@ trap 'INTERRUPTED=1; fail_run' INT TERM
 # PART 4  PROBES
 # ═══════════════════════════════════════════════════════════════════════════
 
+# The mount a configured path sits under — SMB_MOUNT_POINT, or one of
+# EXTRA_MOUNTS when the backups are spread over more than one filer. Empty
+# means the path is on none of them: an ordinary local directory that would
+# accept writes and deletes on the root filesystem.
+mount_for() {
+  local p="$1" m
+  for m in $SMB_MOUNT_POINT $EXTRA_MOUNTS; do
+    [[ "$p" == "$m"/* ]] && { printf '%s' "$m"; return 0; }
+  done
+  return 1
+}
+
 # -h is omitted entirely when MYSQL_HOST is empty: that is what selects the
 # local socket rather than a TCP connection to 'localhost'.
 mysql_args() {
@@ -362,8 +379,7 @@ kf() { [[ -f "$2" ]] && awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; 
 
 usage() {
   cat <<EOF
-Usage: $0 --server_name=NAME --base_dir=PATH [--mysql_host=HOST]
-          [--mode=ALL|SELECTED] [--db_list_dir=PATH] [--no-source-check]
+Usage: $0 --server_name=NAME --base_dir=PATH [--no-source-check]
 
   Step 1  list      resolve the database list
   Step 2  dump      mysqldump each database, archive and checksum it
@@ -372,16 +388,15 @@ Usage: $0 --server_name=NAME --base_dir=PATH [--mysql_host=HOST]
 
   --server_name=NAME    the server this data came from; names the dump tree
   --base_dir=PATH       dump root on the share, e.g. /livestorage/Logical/NAME
-  --mysql_host=HOST     instance to dump (default: $MYSQL_HOST; empty = local socket)
-  --mode=ALL|SELECTED   ALL = every non-system schema (default: $BACKUP_MODE)
-  --db_list_dir=PATH    SELECTED only: directory of .txt/.csv/.lst list files,
-                        newest file wins
   --no-source-check     dump whatever the instance holds, even when the newest
                         restore marker on this host is for a different server
 
-Examples:
-  $0 --server_name=Cloud-Live-DB-Default --base_dir=/livestorage/Logical/Cloud-Live-DB-Default
-  $0 --server_name=GSP-Cloud-Live-DB --base_dir=/livestorage/Logical/GSP-Cloud-Live-DB --mode=SELECTED --db_list_dir=/Data/script/dblist
+Every non-system schema on the instance is dumped. Credentials come from PART
+1A, unless DBVAULT_MYSQL_USER / DBVAULT_MYSQL_PASSWORD are set in the
+environment — which is how final.sh passes per-server credentials through.
+
+Example:
+  $0 --server_name=Cloud-Live-DB-Default --base_dir=/livestorage/Backup/Cloud-Live-DB-Default
 EOF
   trap - ERR INT TERM
   exit 1
@@ -395,17 +410,14 @@ for arg in "$@"; do
   case "$arg" in
     --server_name=*)   SERVER_NAME="${arg#*=}" ;;
     --base_dir=*)      BASE_DIR="${arg#*=}" ;;
-    --mysql_host=*)    MYSQL_HOST="${arg#*=}" ;;
-    --mode=*)          BACKUP_MODE="${arg#*=}" ;;
-    --db_list_dir=*)   DB_LIST_DIR="${arg#*=}" ;;
     --no-source-check) SOURCE_CHECK=0 ;;
     -h|--help)         usage ;;
     *) echo "[ERROR] Unknown argument: $arg" >&2; usage ;;
   esac
 done
 
-# PART 1E, deferred to here: --mysql_host= has now had its chance to supply
-# one of the values the guard insists on.
+# PART 1E, deferred to here: the credential override above has now had its
+# chance to supply the values the guard insists on.
 check_set_me
 
 resolve_bin MYSQL_BIN     mysql
@@ -420,12 +432,6 @@ resolve_bin MYSQLDUMP_BIN mysqldump
 [[ "$BASE_DIR" == /* ]] \
   || argfail "--base_dir must be an absolute path: $BASE_DIR"
 BASE_DIR="${BASE_DIR%/}"
-
-case "$BACKUP_MODE" in
-  ALL) ;;
-  SELECTED) [[ -n "$DB_LIST_DIR" ]] || argfail "--mode=SELECTED needs --db_list_dir" ;;
-  *) argfail "Invalid --mode: $BACKUP_MODE (expected ALL or SELECTED)" ;;
-esac
 
 [[ "$PARALLEL" =~ ^[1-9][0-9]*$ ]] \
   || argfail "PARALLEL must be a positive integer, got '$PARALLEL'"
@@ -499,7 +505,6 @@ kv "run id"      "$RUN_ID"
 kv "source"      "${MYSQL_HOST:-local socket}"
 kv "destination" "$BACKUP_DIR"
 kv "staging"     "$BUILD_DIR (dump, archive, checksum — then moved to the share)"
-kv "mode"        "$BACKUP_MODE"
 kv "parallel"    "$PARALLEL"
 kv "logs"        "$LOCAL_STAGE during the run, moved to the share at the end"
 sub
@@ -534,12 +539,15 @@ ok "required binaries"
 # OUTSIDE the mount is a perfectly writable local directory: the dumps land on
 # the root filesystem and fill it, reporting success the whole way.
 check
-[[ "$BASE_DIR" == "$SMB_MOUNT_POINT"/* ]] \
+BASE_MOUNT="$(mount_for "$BASE_DIR")" \
   || die "$(leader 'base dir' 'OFF THE SHARE')" \
          "--base_dir is $BASE_DIR" \
-         "which is not under the mount point $SMB_MOUNT_POINT" \
+         "which is under neither $SMB_MOUNT_POINT nor EXTRA_MOUNTS (${EXTRA_MOUNTS:-none})" \
          "dumps written there would fill the root filesystem instead of the NAS"
-val "base dir" "under $SMB_MOUNT_POINT"
+mountpoint -q "$BASE_MOUNT" \
+  || die "$(leader 'base dir' 'NOT MOUNTED')" \
+         "$BASE_MOUNT holds --base_dir but is not a mount point"
+val "base dir" "under $BASE_MOUNT"
 
 check
 mountpoint -q "$SMB_MOUNT_POINT" \
@@ -636,22 +644,6 @@ else
 fi
 
 check
-if [[ "$BACKUP_MODE" == "SELECTED" ]]; then
-  [[ -d "$DB_LIST_DIR" ]] \
-    || die "$(leader 'db list dir' 'NOT A DIRECTORY')" "$DB_LIST_DIR"
-  DB_LIST_FILE="$(find "$DB_LIST_DIR" -maxdepth 1 -type f \
-                    \( -name '*.txt' -o -name '*.csv' -o -name '*.lst' \) \
-                    -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)"
-  [[ -n "$DB_LIST_FILE" ]] \
-    || die "$(leader 'db list dir' 'EMPTY')" "no .txt/.csv/.lst in $DB_LIST_DIR"
-  [[ -r "$DB_LIST_FILE" ]] \
-    || die "$(leader 'db list dir' 'UNREADABLE')" "$DB_LIST_FILE"
-  val "db list dir" "$(basename "$DB_LIST_FILE")"
-else
-  skp "db list dir" "n/a (mode=ALL)"
-fi
-
-check
 CORES="$(nproc 2>/dev/null || echo 0)"
 if [[ "$CORES" -gt 0 && "$PARALLEL" -gt "$CORES" ]]; then
   nok "parallel setting" "OVERSUBSCRIBED"
@@ -698,15 +690,10 @@ sub
 
 phase list 1/4
 
-if [[ "$BACKUP_MODE" == "ALL" ]]; then
-  # A grep that matches nothing exits 1, which pipefail turns into a failed
-  # assignment — hence `|| true` on every list-building substitution here.
-  DATABASES="$(mysql_q "SHOW DATABASES" \
-                | grep -Ev '^(information_schema|performance_schema|mysql|sys)$' || true)"
-else
-  info "reading $DB_LIST_FILE"
-  DATABASES="$(grep -vE '^[[:space:]]*$|^[[:space:]]*#' "$DB_LIST_FILE" || true)"
-fi
+# A grep that matches nothing exits 1, which pipefail turns into a failed
+# assignment — hence `|| true` on every list-building substitution here.
+DATABASES="$(mysql_q "SHOW DATABASES" \
+              | grep -Ev '^(information_schema|performance_schema|mysql|sys)$' || true)"
 
 # Count non-blank lines: `wc -l` on an empty string returns 1, not 0.
 DB_COUNT="$(printf '%s\n' "$DATABASES" | grep -c '[^[:space:]]' || true)"
@@ -716,23 +703,9 @@ DB_COUNT="${DB_COUNT:-0}"
   || die "$(leader 'database list' 'EMPTY')" \
          "nothing would be dumped, and a run that dumps nothing must not be" \
          "allowed to report success" \
-         "mode=$BACKUP_MODE, source=${MYSQL_HOST:-local socket}"
+         "source=${MYSQL_HOST:-local socket}"
 
 val "database list" "$DB_COUNT database(s)"
-
-# In SELECTED mode a listed name may simply not exist on this instance.
-if [[ "$BACKUP_MODE" == "SELECTED" ]]; then
-  PRESENT="$(mysql_q "SHOW DATABASES" || true)"
-  MISSING=""
-  while IFS= read -r db; do
-    [[ -n "$db" ]] || continue
-    grep -qxF "$db" <<< "$PRESENT" || MISSING="${MISSING}${db} "
-  done <<< "$DATABASES"
-  if [[ -n "$MISSING" ]]; then
-    nok "listed but absent" "$MISSING"
-    cont "each one is recorded as a failed database, not skipped quietly"
-  fi
-fi
 
 while IFS= read -r db; do
   [[ -n "$db" ]] && cont "$db"
@@ -1002,8 +975,6 @@ finished_at=$(date '+%F %T')
 dumped_from=${MYSQL_HOST:-local socket}
 restored_from_backup_id=${SOURCE_BACKUP_ID:-unknown}
 restore_marker=${RESTORE_MARKER:-none}
-backup_mode=${BACKUP_MODE}
-db_list_file=${DB_LIST_FILE:-n/a}
 db_count=${DB_COUNT}
 ok_count=${OK_COUNT}
 failed_count=${FAILED_COUNT}

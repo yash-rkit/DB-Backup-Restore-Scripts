@@ -48,6 +48,7 @@ set -euo pipefail
 # datadir once per server in servers.json, every night, unattended.
 CONFIRM_RESTORE_VM="__SET_ME__"                      # 1 = restore VM, 0 = refuse to run
 SMB_MOUNT_POINT="__SET_ME__"                         # the mount point itself; MUST match the children
+EXTRA_MOUNTS=""                                      # other mounts that may hold server paths, space separated
 
 # ── 1B  TUNING ─────────────────────────────────────────────────────────────
 PIPELINE_LOG_BASE="/livestorage/final/pipeline_logs" # one directory per pipeline run
@@ -57,6 +58,7 @@ SHUTDOWN_ON_FAILURE=1                                # every log is on the share
 
 # ── 1C  SHARED ─────────────────────────────────────────────────────────────
 CONFIG_FILE="/Data/script/servers.json"              # the server list; --config= overrides
+DUMP_ROOT="/livestorage/Backup"                       # base_dir when an entry omits it
 LOCAL_STAGE="/Data/dbvault-stage"                    # logs, during the run
 LOCK_DIR="/var/lock/dbvault"
 
@@ -179,6 +181,7 @@ elapsed() {
 
 START_EPOCH="$(date +%s)"
 SERVER_COUNT=0
+RESTORE_COUNT=0
 DONE_COUNT=0
 OK_SERVERS=()
 FAILED_SERVERS=()
@@ -272,8 +275,8 @@ fail_run() {
     cont "${OK_SERVERS[*]}"
     cont "their dumps are published and verified"
   fi
-  if [[ $DONE_COUNT -lt $SERVER_COUNT ]]; then
-    erro "$(( SERVER_COUNT - DONE_COUNT )) server(s) were never attempted"
+  if [[ $DONE_COUNT -lt $RESTORE_COUNT ]]; then
+    erro "$(( RESTORE_COUNT - DONE_COUNT )) server(s) were never attempted"
     cerr "this datadir now holds whichever server was restored last, if any"
   fi
 
@@ -281,7 +284,7 @@ fail_run() {
 
   sub
   kv "error log" "${ERROR_LOG:-(none)}"
-  banner " RESULT failed phase=${at% *} step=${at#* } servers=${SERVER_COUNT} ok=${#OK_SERVERS[@]} failed=${#FAILED_SERVERS[@]} dur_s=$(( $(date +%s) - START_EPOCH )) warn=${WARN_COUNT}"
+  banner " RESULT failed phase=${at% *} step=${at#* } servers=${SERVER_COUNT} restored=${RESTORE_COUNT} ok=${#OK_SERVERS[@]} failed=${#FAILED_SERVERS[@]} dur_s=$(( $(date +%s) - START_EPOCH )) warn=${WARN_COUNT}"
 
   publish_logs
 
@@ -312,6 +315,18 @@ trap 'INTERRUPTED=1; fail_run' INT TERM
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 4  PROBES
 # ═══════════════════════════════════════════════════════════════════════════
+
+# The mount a configured path sits under — SMB_MOUNT_POINT, or one of
+# EXTRA_MOUNTS when the backups are spread over more than one filer. Empty
+# means the path is on none of them: an ordinary local directory that would
+# accept writes and deletes on the root filesystem.
+mount_for() {
+  local p="$1" m
+  for m in $SMB_MOUNT_POINT $EXTRA_MOUNTS; do
+    [[ "$p" == "$m"/* ]] && { printf '%s' "$m"; return 0; }
+  done
+  return 1
+}
 
 writable() {
   local probe="$1/.probe_$$"
@@ -380,13 +395,16 @@ Config file — an array of objects:
   ]
 
   server_name   required  identity, and the name of the dump tree
-  backup_base   required  where that server's backup.sh publishes its .xbstream
-  base_dir      required  where this run's logical dumps are published
+  backup_base   opt-in    where that server's backup.sh publishes its .xbstream.
+                          Without it the entry is RETENTION-ONLY: not restored
+                          and not dumped, only reached by sync and cleanup
+  base_dir      derived   where this run's logical dumps are published
+                          (default: $DUMP_ROOT/<server_name>)
   backup_id     optional  exact archive id, instead of the date's latest
   skip_binlog   optional  true = restore that one server to the backup point
-  mysql_host    optional  override the dump connection for that server
-  mode          optional  ALL (default) or SELECTED
-  db_list_dir   optional  required by mode SELECTED
+  mysql_user    optional  credentials for a server whose login differs from
+  mysql_password          this host's. Both or neither; exported to the restore
+                          and dump children, never passed as arguments
   sync_dest     optional  backup_sync.sh: destination on the second share
   retention     optional  db_cleanup.sh: "smart" or "days:N"
 
@@ -558,23 +576,33 @@ val "config parses" "$SERVER_COUNT server(s)"
 # Read once into arrays: the loop in PART 9 never touches the file again, so a
 # config edited mid-run cannot change what this run does.
 check
-SERVER_NAMES=();  BASES=(); DUMPS=(); IDS=(); SKIPS=(); HOSTS=(); MODES=(); LISTS=()
+SERVER_NAMES=();  BASES=(); DUMPS=(); IDS=(); SKIPS=(); USERS=(); PASSES=()
 PROBLEMS=0
+RETENTION_ONLY=""
+USED_MOUNTS=""
 for i in $(seq 0 $((SERVER_COUNT - 1))); do
   n="$(jqv ".[$i].server_name // empty")"
   b="$(jqv ".[$i].backup_base // empty")"
   d="$(jqv ".[$i].base_dir // empty")"
+  b="${b%/}"; d="${d%/}"
+
+  # base_dir is derived when absent — every dump tree sits under DUMP_ROOT,
+  # named for its server. backup_base is never derived: an entry without one
+  # has no archive to restore from, so this pipeline does not touch it. It is
+  # in the file for backup_sync.sh and db_cleanup.sh, and is named as such
+  # below rather than quietly failing a restore every night.
+  [[ -n "$d" || -z "$n" ]] || d="${DUMP_ROOT}/${n}"
+
   SERVER_NAMES+=("$n"); BASES+=("$b"); DUMPS+=("$d")
   IDS+=("$(jqv ".[$i].backup_id // empty")")
   SKIPS+=("$(jqv ".[$i].skip_binlog // empty")")
-  HOSTS+=("$(jqv ".[$i].mysql_host // empty")")
-  MODES+=("$(jqv ".[$i].mode // empty")")
-  LISTS+=("$(jqv ".[$i].db_list_dir // empty")")
+  USERS+=("$(jqv ".[$i].mysql_user // empty")")
+  PASSES+=("$(jqv ".[$i].mysql_password // empty")")
 
   label="entry $((i + 1))/$SERVER_COUNT"
-  if [[ -z "$n" || -z "$b" || -z "$d" ]]; then
+  if [[ -z "$n" ]]; then
     erro "$(leader "$label" 'INCOMPLETE')"
-    cerr "server_name='$n' backup_base='$b' base_dir='$d' — all three are required"
+    cerr "server_name is required — every other field is derived from it or optional"
     PROBLEMS=$((PROBLEMS + 1))
     continue
   fi
@@ -583,20 +611,24 @@ for i in $(seq 0 $((SERVER_COUNT - 1))); do
     cerr "'$n' — expected [A-Za-z0-9._-]+, it becomes part of file names"
     PROBLEMS=$((PROBLEMS + 1))
   fi
+  [[ -n "$b" ]] || RETENTION_ONLY="${RETENTION_ONLY}${n} "
   for p in "$b" "$d"; do
-    [[ "$p" == "$SMB_MOUNT_POINT"/* ]] && continue
+    [[ -z "$p" ]] && continue
+    if m="$(mount_for "$p")"; then
+      USED_MOUNTS="${USED_MOUNTS} ${m}"
+      continue
+    fi
     erro "$(leader "$label" 'PATH OFF THE SHARE')"
-    cerr "'$p' is not under $SMB_MOUNT_POINT"
+    cerr "'$p' is not under $SMB_MOUNT_POINT${EXTRA_MOUNTS:+ or $EXTRA_MOUNTS}"
+    cerr "add its mount to EXTRA_MOUNTS in PART 1A if that mount is real"
     PROBLEMS=$((PROBLEMS + 1))
   done
-  if [[ -n "${MODES[$i]}" && "${MODES[$i]}" != "ALL" && "${MODES[$i]}" != "SELECTED" ]]; then
-    erro "$(leader "$label" 'BAD MODE')"
-    cerr "'${MODES[$i]}' — expected ALL or SELECTED"
-    PROBLEMS=$((PROBLEMS + 1))
-  fi
-  if [[ "${MODES[$i]}" == "SELECTED" && -z "${LISTS[$i]}" ]]; then
-    erro "$(leader "$label" 'MODE NEEDS A LIST')"
-    cerr "mode SELECTED requires db_list_dir"
+  # Credentials travel as a pair or not at all: half an override is a login
+  # this host cannot make, discovered three hours into the night.
+  if { [[ -n "${USERS[$i]}" ]] && [[ -z "${PASSES[$i]}" ]]; } \
+     || { [[ -z "${USERS[$i]}" ]] && [[ -n "${PASSES[$i]}" ]]; }; then
+    erro "$(leader "$label" 'HALF A CREDENTIAL')"
+    cerr "mysql_user and mysql_password must both be set, or neither"
     PROBLEMS=$((PROBLEMS + 1))
   fi
 
@@ -661,6 +693,22 @@ fi
          "the whole config is validated before the first datadir is erased"
 ok "config entries"
 
+# Entries this pipeline actually restores and dumps. The rest carry no
+# backup_base: their dumps arrive by some other route, and they are listed here
+# only so sync and cleanup reach their trees.
+RESTORE_COUNT=0
+for i in $(seq 0 $((SERVER_COUNT - 1))); do
+  [[ -n "${BASES[$i]}" ]] && RESTORE_COUNT=$((RESTORE_COUNT + 1))
+done
+if [[ -n "$RETENTION_ONLY" ]]; then
+  val "restored" "$RESTORE_COUNT/$SERVER_COUNT entries — the rest are retention-only"
+  cont "no backup_base, so not restored or dumped: $RETENTION_ONLY"
+fi
+[[ $RESTORE_COUNT -gt 0 ]] \
+  || die "$(leader 'config entries' 'NOTHING TO RESTORE')" \
+         "not one entry carries backup_base — this pipeline would restore nothing" \
+         "run backup_sync.sh and db_cleanup.sh directly if that is what you meant"
+
 # Both closing steps are opt-in, per entry. With no sync_dest anywhere there is
 # nowhere to copy to, and with no retention anywhere there is no policy to
 # apply — running either would be a no-op walk over the share, so neither runs.
@@ -681,34 +729,40 @@ else
   val "physical rules" "$PHYS_RET_TARGETS/$SERVER_COUNT entries have physical_retention"
 fi
 
+# Every mount the config actually refers to, not just the primary: unmounted,
+# a backup_base reads as an empty directory and its server looks as though it
+# had never been backed up.
 check
-mountpoint -q "$SMB_MOUNT_POINT" \
-  || die "$(leader 'smb share' 'NOT MOUNTED')" \
-         "expected a mount at $SMB_MOUNT_POINT" \
-         "unmounted, every backup_base reads as an empty directory and every" \
-         "server would look as though it had never been backed up"
-ok "smb share"
+for m in $(printf '%s\n' $SMB_MOUNT_POINT $USED_MOUNTS | sort -u); do
+  mountpoint -q "$m" \
+    || die "$(leader 'smb shares' 'NOT MOUNTED')" \
+           "expected a mount at $m" \
+           "servers under it would look as though they had never been backed up"
+done
+val "smb shares" "$(printf '%s ' $(printf '%s\n' $SMB_MOUNT_POINT $USED_MOUNTS | sort -u))mounted"
 
 check
 MISSING_BASES=0
 for i in $(seq 0 $((SERVER_COUNT - 1))); do
+  [[ -n "${BASES[$i]}" ]] || continue
   if [[ ! -d "${BASES[$i]}" ]]; then
     nok "${SERVER_NAMES[$i]}" "NO BACKUP DIRECTORY"
     cont "expected ${BASES[$i]}"
     MISSING_BASES=$((MISSING_BASES + 1))
   fi
 done
-[[ $MISSING_BASES -lt $SERVER_COUNT ]] \
+[[ $MISSING_BASES -lt $RESTORE_COUNT ]] \
   || die "$(leader 'backup directories' 'NONE PRESENT')" \
          "not one configured backup_base exists under $SMB_MOUNT_POINT" \
          "the share may be mounted from the wrong account"
-val "backup directories" "$(( SERVER_COUNT - MISSING_BASES ))/$SERVER_COUNT present"
+val "backup directories" "$(( RESTORE_COUNT - MISSING_BASES ))/$RESTORE_COUNT present"
 
 check
 if [[ $DRY_RUN -eq 1 ]]; then
   skp "dump directories" "n/a (dry run)"
 else
   for i in $(seq 0 $((SERVER_COUNT - 1))); do
+    [[ -n "${BASES[$i]}" ]] || continue        # retention-only: nothing writes here
     mkdir -p "${DUMPS[$i]}" 2>/dev/null \
       || die "$(leader 'dump directories' 'MKDIR FAILED')" "${DUMPS[$i]}"
     writable "${DUMPS[$i]}" \
@@ -764,12 +818,33 @@ SERVERS_EPOCH="$PHASE_EPOCH"
 
 for i in $(seq 0 $((SERVER_COUNT - 1))); do
   name="${SERVER_NAMES[$i]}"
+
+  # Cleared at the top, set below only if this entry carries a pair. Doing it
+  # here rather than at the end covers every `continue` out of this loop.
+  unset DBVAULT_MYSQL_USER DBVAULT_MYSQL_PASSWORD
+
+  # No backup_base, nothing to restore from. Named in pre-flight already, so
+  # this is a one-line note rather than a warning: it is the configured intent.
+  if [[ -z "${BASES[$i]}" ]]; then
+    skp "$name" "retention-only (no backup_base)"
+    continue
+  fi
+
   CURRENT="$name ($((i + 1))/$SERVER_COUNT)"
 
   sub
   info "[$((i + 1))/$SERVER_COUNT] $name"
   cont "archive from ${BASES[$i]}"
   cont "dumps to     ${DUMPS[$i]}"
+
+  # This server's own credentials, if its entry carries a pair. Exported, not
+  # passed as arguments, so the password stays out of ps; unset again after the
+  # dump so it cannot leak into the next server's children.
+  if [[ -n "${USERS[$i]}" ]]; then
+    export DBVAULT_MYSQL_USER="${USERS[$i]}"
+    export DBVAULT_MYSQL_PASSWORD="${PASSES[$i]}"
+    cont "credentials  ${USERS[$i]} (from servers.json)"
+  fi
 
   # --- restore ---------------------------------------------------------
   R_ARGS=("$RESTORE_SCRIPT" "--server_name=$name" "--backup_base=${BASES[$i]}")
@@ -801,9 +876,6 @@ for i in $(seq 0 $((SERVER_COUNT - 1))); do
   fi
 
   L_ARGS=("$LOGICAL_SCRIPT" "--server_name=$name" "--base_dir=${DUMPS[$i]}")
-  [[ -n "${HOSTS[$i]}" ]] && L_ARGS+=("--mysql_host=${HOSTS[$i]}")
-  [[ -n "${MODES[$i]}" ]] && L_ARGS+=("--mode=${MODES[$i]}")
-  [[ -n "${LISTS[$i]}" ]] && L_ARGS+=("--db_list_dir=${LISTS[$i]}")
 
   if ! run_child "${L_ARGS[@]}"; then
     erro "$(leader "$name" 'DUMP FAILED')"
@@ -824,10 +896,10 @@ CURRENT=""
 
 sub
 if [[ ${#FAILED_SERVERS[@]} -gt 0 ]]; then
-  nok "servers" "${#OK_SERVERS[@]}/$SERVER_COUNT  (${#FAILED_SERVERS[@]} failed)"
+  nok "servers" "${#OK_SERVERS[@]}/$RESTORE_COUNT  (${#FAILED_SERVERS[@]} failed)"
   cont "failed: ${FAILED_SERVERS[*]}"
 else
-  val "servers" "${#OK_SERVERS[@]}/$SERVER_COUNT  ($(elapsed "$SERVERS_EPOCH"))"
+  val "servers" "${#OK_SERVERS[@]}/$RESTORE_COUNT  ($(elapsed "$SERVERS_EPOCH"))"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -933,7 +1005,7 @@ else
 fi
 kv "duration"  "$(elapsed "$START_EPOCH")"
 kv "mode"      "$RUN_MODE"
-kv "servers"   "$SERVER_COUNT configured, ${#OK_SERVERS[@]} succeeded, ${#FAILED_SERVERS[@]} failed"
+kv "servers"   "$SERVER_COUNT configured, $RESTORE_COUNT restored, ${#OK_SERVERS[@]} succeeded, ${#FAILED_SERVERS[@]} failed"
 kv "succeeded" "${OK_SERVERS[*]:-none}"
 kv "failed"    "${FAILED_SERVERS[*]:-none}"
 kv "sync"      "$SYNC_STATE"
@@ -952,9 +1024,9 @@ sub
 kv "logs" "$PIPELINE_LOG_DIR/"
 
 if [[ $PIPELINE_OK -eq 1 ]]; then
-  banner " RESULT ok run=${RUN_STAMP} servers=${SERVER_COUNT} ok=${#OK_SERVERS[@]} failed=0 sync=${SYNC_STATE} cleanup=${CLEANUP_STATE} dur_s=$(( $(date +%s) - START_EPOCH )) warn=${WARN_COUNT}"
+  banner " RESULT ok run=${RUN_STAMP} servers=${SERVER_COUNT} restored=${RESTORE_COUNT} ok=${#OK_SERVERS[@]} failed=0 sync=${SYNC_STATE} cleanup=${CLEANUP_STATE} dur_s=$(( $(date +%s) - START_EPOCH )) warn=${WARN_COUNT}"
 else
-  banner " RESULT failed run=${RUN_STAMP} servers=${SERVER_COUNT} ok=${#OK_SERVERS[@]} failed=${#FAILED_SERVERS[@]} sync=${SYNC_STATE} cleanup=${CLEANUP_STATE} dur_s=$(( $(date +%s) - START_EPOCH )) warn=${WARN_COUNT}"
+  banner " RESULT failed run=${RUN_STAMP} servers=${SERVER_COUNT} restored=${RESTORE_COUNT} ok=${#OK_SERVERS[@]} failed=${#FAILED_SERVERS[@]} sync=${SYNC_STATE} cleanup=${CLEANUP_STATE} dur_s=$(( $(date +%s) - START_EPOCH )) warn=${WARN_COUNT}"
 fi
 
 publish_logs

@@ -43,6 +43,7 @@ set -euo pipefail
 
 # ── 1A  SET PER VM ─────────────────────────────────────────────────────────
 SOURCE_MOUNT_POINT="__SET_ME__"                      # mount point holding every base_dir
+EXTRA_MOUNTS=""                                      # other mounts that may hold a base_dir, space separated
 DEST_MOUNT_POINT="__SET_ME__"                        # mount point holding every sync_dest — a DIFFERENT filer
 
 # ── 1B  TUNING ─────────────────────────────────────────────────────────────
@@ -53,6 +54,7 @@ KEEP_LOCAL_DAYS=14                                   # prune logs stranded here
 
 # ── 1C  SHARED ─────────────────────────────────────────────────────────────
 CONFIG_FILE="/Data/script/servers.json"              # the server list; --config= overrides
+DUMP_ROOT="/livestorage/Backup"                       # base_dir when an entry omits it
 LOCAL_STAGE="/Data/dbvault-stage"                    # logs only, during the run
 LOCK_DIR="/var/lock/dbvault"
 ARCHIVE_GLOB="*.tar.gz"
@@ -306,6 +308,18 @@ trap 'INTERRUPTED=1; fail_run' INT TERM
 # PART 4  PROBES
 # ═══════════════════════════════════════════════════════════════════════════
 
+# The mount a configured path sits under — SOURCE_MOUNT_POINT, or one of
+# EXTRA_MOUNTS when the backups are spread over more than one filer. Empty
+# means the path is on none of them: an ordinary local directory that would
+# accept writes and deletes on the root filesystem.
+mount_for() {
+  local p="$1" m
+  for m in $SOURCE_MOUNT_POINT $EXTRA_MOUNTS; do
+    [[ "$p" == "$m"/* ]] && { printf '%s' "$m"; return 0; }
+  done
+  return 1
+}
+
 free_mb() { df -BM --output=avail "$1" | tail -1 | tr -dc '0-9'; }
 
 writable() {
@@ -355,7 +369,8 @@ Usage: $0 [--config=PATH] [--retention_days=N] [--dry-run]
   --dry-run            report every copy and delete without performing any
 
 Per entry in the config file:
-  base_dir    required  the source — where logical.sh published the dumps
+  base_dir    derived   the source — where logical.sh published the dumps
+                        (default: $DUMP_ROOT/<server_name>)
   sync_dest   opt-in    the destination on the second share
 
 An entry without sync_dest is not copied anywhere. If no entry has one, there
@@ -460,33 +475,41 @@ SERVER_COUNT="$(jqv 'length')"
   || die "$(leader 'config parses' 'EMPTY')" "no entries in $CONFIG_FILE"
 
 PROBLEMS=0
+USED_MOUNTS=""
 for i in $(seq 0 $((SERVER_COUNT - 1))); do
   n="$(jqv ".[$i].server_name // empty")"
   s="$(jqv ".[$i].base_dir // empty")"
   d="$(jqv ".[$i].sync_dest // empty")"
   label="entry $((i + 1))/$SERVER_COUNT"
 
-  if [[ -z "$n" || -z "$s" ]]; then
+  if [[ -z "$n" ]]; then
     erro "$(leader "$label" 'INCOMPLETE')"
-    cerr "server_name='$n' base_dir='$s' — both are required"
+    cerr "server_name is required — every other field is derived from it or optional"
     PROBLEMS=$((PROBLEMS + 1))
     continue
   fi
+
+  # Same derivation as db_cleanup.sh and final.sh: no base_dir means the tree
+  # sits under DUMP_ROOT, named for its server.
+  s="${s%/}"
+  [[ -n "$s" ]] || s="${DUMP_ROOT}/${n}"
   # Opt-in: no sync_dest, no copy. Counted and named, so a server that was
   # meant to be synced and lost its key is visible rather than silently absent.
   if [[ -z "$d" ]]; then
     NOT_CONFIGURED="${NOT_CONFIGURED}${n} "
     continue
   fi
-  s="${s%/}"; d="${d%/}"
+  d="${d%/}"
 
   # Both mounts get the same treatment as everywhere else: a path outside its
   # mount is an ordinary writable local directory, so the copies would land on
   # the root filesystem and the retention pass would expire real files from
   # wherever they did land.
-  if [[ "$s" != "$SOURCE_MOUNT_POINT"/* ]]; then
+  if m="$(mount_for "$s")"; then
+    USED_MOUNTS="${USED_MOUNTS} ${m}"
+  else
     erro "$(leader "$label" 'SOURCE OFF THE SHARE')"
-    cerr "base_dir '$s' is not under $SOURCE_MOUNT_POINT"
+    cerr "base_dir '$s' is not under $SOURCE_MOUNT_POINT${EXTRA_MOUNTS:+ or $EXTRA_MOUNTS}"
     PROBLEMS=$((PROBLEMS + 1))
   fi
   if [[ "$d" != "$DEST_MOUNT_POINT"/* ]]; then
@@ -532,12 +555,14 @@ if [[ $SYNC_COUNT -eq 0 ]]; then
 fi
 
 check
-mountpoint -q "$SOURCE_MOUNT_POINT" \
-  || die "$(leader 'source share' 'NOT MOUNTED')" \
-         "expected a mount at $SOURCE_MOUNT_POINT" \
-         "an unmounted share is an empty directory: every server would look" \
-         "like it had produced no dumps at all"
-ok "source share"
+for m in $(printf '%s\n' $SOURCE_MOUNT_POINT $USED_MOUNTS | sort -u); do
+  mountpoint -q "$m" \
+    || die "$(leader 'source shares' 'NOT MOUNTED')" \
+           "expected a mount at $m" \
+           "an unmounted share is an empty directory: every server under it" \
+           "would look like it had produced no dumps at all"
+done
+val "source shares" "$(printf '%s ' $(printf '%s\n' $SOURCE_MOUNT_POINT $USED_MOUNTS | sort -u))mounted"
 
 check
 mountpoint -q "$DEST_MOUNT_POINT" \

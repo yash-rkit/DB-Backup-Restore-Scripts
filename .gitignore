@@ -1,2 +1,11 @@
 .DS_Store
 /logs
+
+# age keys — private keys must never be committed
+key*.txt
+*-key.txt
+*.agekey
+recipients.txt
+Cloud-Live-DB-*
+tests/
+cleanup.log

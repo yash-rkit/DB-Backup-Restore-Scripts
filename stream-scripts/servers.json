@@ -1,5 +1,61 @@
 [
   {
+    "server_name": "Auth-DB",
+    "backup_base": "/livestorage/Backup/Auth-DB/percona",
+    "base_dir": "/livestorage/Backup/Auth-DB",
+    "sync_dest": "/southstorage/backup_latest/Auth-DB",
+    "retention": "days:30",
+    "physical_retention": "days:3"
+  },
+  {
+    "server_name": "Cloud-Cen-DB",
+    "backup_base": "/livestorage/Backup/Cloud-Cen-DB/percona",
+    "base_dir": "/livestorage/Backup/Cloud-Cen-DB",
+    "sync_dest": "/southstorage/backup_latest/Cloud-Cen-DB",
+    "retention": "days:30",
+    "physical_retention": "days:3"
+  },
+  {
+    "server_name": "Cloud-GPR-Cen-DB",
+    "backup_base": "/livestorage/Backup/Cloud-GPR-Cen-DB/percona",
+    "base_dir": "/livestorage/Backup/Cloud-GPR-Cen-DB",
+    "sync_dest": "/southstorage/backup_latest/Cloud-GPR-Cen-DB",
+    "retention": "days:15",
+    "physical_retention": "days:3"
+  },
+  {
+    "server_name": "Auto-DB-Demo",
+    "backup_base": "/livestorage/Backup/Auto-DB-Demo/percona",
+    "base_dir": "/livestorage/Backup/Auto-DB-Demo",
+    "sync_dest": "/southstorage/backup_latest/Auto-DB-Demo",
+    "retention": "days:7",
+    "physical_retention": "days:3",
+    "mysql_user": "Admin",
+    "mysql_password": ""
+  },
+  {
+    "server_name": "AUTODB-Live",
+    "backup_base": "/livestorage/Backup/AUTODB-Live/percona",
+    "base_dir": "/livestorage/Backup/AUTODB-Live",
+    "sync_dest": "/southstorage/backup_latest/AUTODB-Live",
+    "retention": "days:7",
+    "physical_retention": "days:3",
+    "mysql_user": "Admin",
+    "mysql_password": ""
+  },
+  {
+    "server_name": "Autopublish-DB",
+    "backup_base": "/livestorage/Backup/Autopublish-DB/percona",
+    "base_dir": "/livestorage/Backup/Autopublish-DB",
+    "sync_dest": "/southstorage/backup_latest/Autopublish-DB",
+    "retention": "days:7",
+    "physical_retention": "days:3"
+  },
+  {
+    "server_name": "Cloud-Live-DB-Sandbox",
+    "retention": "days:30"
+  },
+  {
     "server_name": "Cloud-Live-DB-Default",
     "backup_base": "/livestorage/Backup/Cloud-Live-DB-Default/percona",
     "base_dir": "/livestorage/Backup/Cloud-Live-DB-Default",
@@ -24,27 +80,59 @@
     "physical_retention": "days:10"
   },
   {
+    "server_name": "Cloud-Live-DB-Demo-Sandbox",
+    "backup_base": "/livestorage/Backup/Cloud-Live-DB-Demo-Sandbox/percona",
+    "base_dir": "/livestorage/Backup/Cloud-Live-DB-Demo-Sandbox",
+    "sync_dest": "/southstorage/backup_latest/Cloud-Live-DB-Demo-Sandbox",
+    "retention": "days:7",
+    "physical_retention": "days:3"
+  },
+  {
+    "server_name": "GPR-Live-DB",
+    "backup_base": "/livestorage/Backup/GPR-Live-DB/percona",
+    "base_dir": "/livestorage/Backup/GPR-Live-DB",
+    "sync_dest": "/southstorage/backup_latest/GPR-Live-DB",
+    "retention": "days:30",
+    "physical_retention": "days:3"
+  },
+  {
     "server_name": "GSP-Cloud-Live-DB",
     "backup_base": "/livestorage/Backup/GSP-Cloud-Live-DB/percona",
     "base_dir": "/livestorage/Backup/GSP-Cloud-Live-DB",
     "sync_dest": "/southstorage/backup_latest/GSP-Cloud-Live-DB",
-    "retention": "days:30",
-    "physical_retention": "days:10"
+    "retention": "days:10",
+    "physical_retention": "days:3"
   },
   {
     "server_name": "DKT-EInvoice-Live-Hub-DB",
     "backup_base": "/livestorage/Backup/DKT-EInvoice-Live-Hub-DB/percona",
     "base_dir": "/livestorage/Backup/DKT-EInvoice-Live-Hub-DB",
     "sync_dest": "/southstorage/backup_latest/DKT-EInvoice-Live-Hub-DB",
-    "retention": "days:30",
-    "physical_retention": "days:10"
+    "retention": "days:10",
+    "physical_retention": "days:3"
   },
   {
     "server_name": "DKT-EInvoice-Live-Log-DB",
     "backup_base": "/livestorage/Backup/DKT-EInvoice-Live-Log-DB/percona",
     "base_dir": "/livestorage/Backup/DKT-EInvoice-Live-Log-DB",
     "sync_dest": "/southstorage/backup_latest/DKT-EInvoice-Live-Log-DB",
-    "retention": "days:30",
-    "physical_retention": "days:10"
+    "retention": "days:10",
+    "physical_retention": "days:3"
+  },
+  {
+    "server_name": "CEN-SERVER",
+    "backup_base": "/gplivebkp/CEN-SERVER/percona",
+    "base_dir": "/gplivebkp/CEN-SERVER",
+    "sync_dest": "/southstorage/backup_latest/CEN-SERVER",
+    "retention": "days:15",
+    "physical_retention": "days:3"
+  },
+  {
+    "server_name": "GPR-LIVE-SYS-DB",
+    "backup_base": "/gplivebkp/GPR-LIVE-SYS-DB/percona",
+    "base_dir": "/media/gplivebkp/GPR-LIVE-SYS-DB",
+    "sync_dest": "/southstorage/backup_latest/GPR-LIVE-SYS-DB",
+    "retention": "smart",
+    "physical_retention": "days:3"
   }
 ]

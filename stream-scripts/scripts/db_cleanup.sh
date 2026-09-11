@@ -6,8 +6,8 @@
 #   base_dir     + retention            the logical dumps, expired file by file
 #   backup_base  + physical_retention   the physical backups, expired set by set
 #
-#   smart    keep everything from the last SMART_DAILY_DAYS days, plus the
-#            newest of each of the SMART_WEEKLY_KEEP most recent weeks
+#   smart    keep everything from the last SMART_DAILY_DAYS days, plus the last
+#            SMART_WEEKDAY_KEEP archives written on SMART_WEEKDAY (1=Mon..7=Sun)
 #   days:N   keep the last N days, delete everything older
 # The newest archive of a database, and the newest physical set of a server,
 # are never deleted under either pattern.
@@ -55,17 +55,21 @@ set -euo pipefail
 
 # ── 1A  SET PER VM ─────────────────────────────────────────────────────────
 SMB_MOUNT_POINT="__SET_ME__"                         # mount point itself; all that stands between rm and /
+EXTRA_MOUNTS=""                                      # other mounts that may hold server paths, space separated
 
 # ── 1B  TUNING ─────────────────────────────────────────────────────────────
-SMART_DAILY_DAYS=7                                   # smart: daily coverage for this long,
-SMART_WEEKLY_KEEP=3                                  #   then this many weeklies
+SMART_DAILY_DAYS=7                                   # smart: keep every dump for this long,
+SMART_WEEKDAY=7                                      #   then this weekday: 1=Mon ... 7=Sun
+SMART_WEEKDAY_KEEP=3                                 #   this many of them
 ALWAYS_KEEP_NEWEST=1                                 # never delete a database's or server's last one
+LOG_KEPT=1                                           # log every archive kept, and why; 0 = deletions only
 CLEANUP_LOG_BASE="/livestorage/final/cleanup_logs"   # this script's logs
 KEEP_CLEANUP_LOG_DAYS=60
 KEEP_LOCAL_DAYS=14                                   # prune logs stranded here
 
 # ── 1C  SHARED ─────────────────────────────────────────────────────────────
 CONFIG_FILE="/Data/script/servers.json"              # the server list; --config= overrides
+DUMP_ROOT="/livestorage/Backup"                       # base_dir when an entry omits it
 LOCAL_STAGE="/Data/dbvault-stage"                    # logs only, during the run
 LOCK_DIR="/var/lock/dbvault"
 
@@ -314,6 +318,18 @@ trap 'INTERRUPTED=1; fail_run' INT TERM
 # PART 4  PROBES
 # ═══════════════════════════════════════════════════════════════════════════
 
+# The mount a configured path sits under — SMB_MOUNT_POINT, or one of
+# EXTRA_MOUNTS when the backups are spread over more than one filer. Empty
+# means the path is on none of them: an ordinary local directory that would
+# accept writes and deletes on the root filesystem.
+mount_for() {
+  local p="$1" m
+  for m in $SMB_MOUNT_POINT $EXTRA_MOUNTS; do
+    [[ "$p" == "$m"/* ]] && { printf '%s' "$m"; return 0; }
+  done
+  return 1
+}
+
 writable() {
   local probe="$1/.probe_$$"
   touch "$probe" 2>/dev/null || return 1
@@ -460,8 +476,18 @@ delete_set() {
 # failed last night, and it has to survive long enough for someone to read it.
 guard_days() {
   case "$1" in
-    smart)  printf '%s' $(( SMART_DAILY_DAYS + SMART_WEEKLY_KEEP * 7 )) ;;
+    smart)  printf '%s' $(( SMART_DAILY_DAYS + SMART_WEEKDAY_KEEP * 7 )) ;;
     days:*) printf '%s' "${1#days:}" ;;
+  esac
+  return 0
+}
+
+# 1..7 as date's %u numbers them, for the log line and the keep reason.
+weekday_name() {
+  case "$1" in
+    1) printf 'Monday'    ;; 2) printf 'Tuesday'  ;; 3) printf 'Wednesday' ;;
+    4) printf 'Thursday'  ;; 5) printf 'Friday'   ;; 6) printf 'Saturday'  ;;
+    7) printf 'Sunday'    ;; *) printf 'weekday %s' "$1" ;;
   esac
   return 0
 }
@@ -515,13 +541,18 @@ Usage: $0 [--config=PATH] [--dry-run]
   --dry-run      list every deletion without performing any
 
 Per entry in the config file:
-  base_dir            required  the dump tree to expire
+  server_name         required  the only required field
+  base_dir            derived   the dump tree to expire
+                                (default: $DUMP_ROOT/<server_name>)
   retention           opt-in    "smart" or "days:N", over base_dir
   backup_base         required alongside physical_retention: the physical tree
   physical_retention  opt-in    "smart" or "days:N", over backup_base
 
-  smart   everything from the last $SMART_DAILY_DAYS days, plus the newest of each of
-          the $SMART_WEEKLY_KEEP most recent weeks beyond that
+So the shortest useful entry is a name and a rule:
+  { "server_name": "Some-DB", "retention": "days:7" }
+
+  smart   everything from the last $SMART_DAILY_DAYS days, plus the last
+          $SMART_WEEKDAY_KEEP archives written on a $(weekday_name "$SMART_WEEKDAY")
   days:N  everything from the last N days
 
 The two rules are independent. An entry without retention keeps every dump; an
@@ -592,6 +623,7 @@ kv "mode"        "$([[ $DRY_RUN -eq 1 ]] && echo 'DRY RUN — nothing is deleted
 kv "config"      "$CONFIG_FILE"
 kv "scope"       "entries with a retention field; the rest are never expired"
 kv "keep newest" "$([[ "$ALWAYS_KEEP_NEWEST" == "1" ]] && echo 'yes, always' || echo 'NO — a database can be emptied')"
+kv "log kept"    "$([[ "$LOG_KEPT" == "1" ]] && echo 'yes — every archive kept is listed with its reason' || echo 'no — deletions only')"
 kv "logs"        "$LOCAL_STAGE during the run, published at the end"
 sub
 
@@ -632,6 +664,7 @@ SERVER_COUNT="$(jqv 'length')"
   || die "$(leader 'config parses' 'EMPTY')" "no entries in $CONFIG_FILE"
 
 PROBLEMS=0
+USED_MOUNTS=""
 for i in $(seq 0 $((SERVER_COUNT - 1))); do
   n="$(jqv ".[$i].server_name // empty")"
   t="$(jqv ".[$i].base_dir // empty")"
@@ -642,12 +675,16 @@ for i in $(seq 0 $((SERVER_COUNT - 1))); do
   t="${t%/}"
   pb="${pb%/}"
 
-  if [[ -z "$n" || -z "$t" ]]; then
+  if [[ -z "$n" ]]; then
     erro "$(leader "$label" 'INCOMPLETE')"
-    cerr "server_name='$n' base_dir='$t' — both are required"
+    cerr "server_name is required — every other field is derived from it or optional"
     PROBLEMS=$((PROBLEMS + 1))
     continue
   fi
+
+  # base_dir is the one path this script can derive: every dump tree sits under
+  # DUMP_ROOT, named for its server. An entry that puts it elsewhere says so.
+  [[ -n "$t" ]] || t="${DUMP_ROOT}/${n}"
 
   # ── the logical rule, over base_dir ──
   # Opt-in: no retention, no expiry. Counted and named, so a server that was
@@ -660,9 +697,11 @@ for i in $(seq 0 $((SERVER_COUNT - 1))); do
     # local directory, and an unmounted share looks like an empty one — which
     # would find nothing, delete nothing, and report a clean run while retention
     # had silently stopped happening.
-    if [[ "$t" != "$SMB_MOUNT_POINT"/* ]]; then
+    if m="$(mount_for "$t")"; then
+      USED_MOUNTS="${USED_MOUNTS} ${m}"
+    else
       erro "$(leader "$label" 'PATH OFF THE SHARE')"
-      cerr "base_dir '$t' is not under $SMB_MOUNT_POINT"
+      cerr "base_dir '$t' is not under $SMB_MOUNT_POINT${EXTRA_MOUNTS:+ or $EXTRA_MOUNTS}"
       PROBLEMS=$((PROBLEMS + 1))
     fi
 
@@ -685,9 +724,11 @@ for i in $(seq 0 $((SERVER_COUNT - 1))); do
       erro "$(leader "$label" 'NO BACKUP_BASE')"
       cerr "physical_retention '$pr' has no backup_base to apply to"
       PROBLEMS=$((PROBLEMS + 1))
-    elif [[ "$pb" != "$SMB_MOUNT_POINT"/* ]]; then
+    elif m="$(mount_for "$pb")"; then
+      USED_MOUNTS="${USED_MOUNTS} ${m}"
+    else
       erro "$(leader "$label" 'PATH OFF THE SHARE')"
-      cerr "backup_base '$pb' is not under $SMB_MOUNT_POINT"
+      cerr "backup_base '$pb' is not under $SMB_MOUNT_POINT${EXTRA_MOUNTS:+ or $EXTRA_MOUNTS}"
       PROBLEMS=$((PROBLEMS + 1))
     fi
 
@@ -731,7 +772,7 @@ if [[ $RET_COUNT -eq 0 && $PHYS_COUNT -eq 0 ]]; then
   kv "effect"  "nothing deleted; every backup is kept and the share keeps growing"
   sub
   emit " to expire a server's dumps, give its entry a retention:"
-  emit "   \"retention\": \"smart\"                7 daily + 3 weekly"
+  emit "   \"retention\": \"smart\"                ${SMART_DAILY_DAYS} daily + last ${SMART_WEEKDAY_KEEP} $(weekday_name "$SMART_WEEKDAY")s"
   emit "   \"retention\": \"days:15\"              the last 15 days"
   emit " to expire its physical backups, set by whole set:"
   emit "   \"physical_retention\": \"days:7\"      the last 7 days of sets"
@@ -743,19 +784,26 @@ if [[ $RET_COUNT -eq 0 && $PHYS_COUNT -eq 0 ]]; then
 fi
 
 check
-mountpoint -q "$SMB_MOUNT_POINT" \
-  || die "$(leader 'smb share' 'NOT MOUNTED')" \
-         "expected a mount at $SMB_MOUNT_POINT" \
-         "an unmounted share reads as an empty tree: nothing would be deleted" \
-         "and the run would report success, hiding that retention has stopped"
-ok "smb share"
+for m in $(printf '%s\n' $SMB_MOUNT_POINT $USED_MOUNTS | sort -u); do
+  mountpoint -q "$m" \
+    || die "$(leader 'smb shares' 'NOT MOUNTED')" \
+           "expected a mount at $m" \
+           "an unmounted share reads as an empty tree: nothing would be deleted" \
+           "and the run would report success, hiding that retention has stopped"
+done
+val "smb shares" "$(printf '%s ' $(printf '%s\n' $SMB_MOUNT_POINT $USED_MOUNTS | sort -u))mounted"
 
 check
-[[ "$SMART_DAILY_DAYS" =~ ^[1-9][0-9]*$ && "$SMART_WEEKLY_KEEP" =~ ^[1-9][0-9]*$ ]] \
+[[ "$SMART_DAILY_DAYS" =~ ^[1-9][0-9]*$ && "$SMART_WEEKDAY_KEEP" =~ ^[1-9][0-9]*$ ]] \
   || die "$(leader 'smart settings' 'INVALID')" \
-         "SMART_DAILY_DAYS=$SMART_DAILY_DAYS SMART_WEEKLY_KEEP=$SMART_WEEKLY_KEEP" \
+         "SMART_DAILY_DAYS=$SMART_DAILY_DAYS SMART_WEEKDAY_KEEP=$SMART_WEEKDAY_KEEP" \
          "both must be positive integers"
-val "smart settings" "${SMART_DAILY_DAYS} daily + ${SMART_WEEKLY_KEEP} weekly"
+[[ "$SMART_WEEKDAY" =~ ^[1-7]$ ]] \
+  || die "$(leader 'smart settings' 'INVALID WEEKDAY')" \
+         "SMART_WEEKDAY=$SMART_WEEKDAY — expected 1..7, as date's %u numbers them" \
+         "1=Monday through 7=Sunday"
+val "smart settings" \
+    "${SMART_DAILY_DAYS} daily + the last ${SMART_WEEKDAY_KEEP} $(weekday_name "$SMART_WEEKDAY")s"
 
 check
 writable "$LOCAL_STAGE" \
@@ -820,34 +868,52 @@ sub
 phase retention 1/3
 
 # days:N — everything older than N days goes, except the newest.
+# One pass, newest first, so keeps and deletes read in date order.
+#
+# The age test is `find -mtime +N` done in arithmetic: age in whole 24h units,
+# truncated, strictly greater than N. Identical to what find would decide, but
+# one process for the directory instead of one per archive — this walks tens of
+# thousands of files over CIFS.
 apply_days() {
   local dir="$1" days="$2" keep="$3"
-  local total=0 removed=0 f
+  local now total=0 removed=0 kept=0 entry mtime age f
+  now="$(date +%s)"
 
-  total="$(find "$dir" -maxdepth 1 -type f -name "$ARCHIVE_GLOB" 2>/dev/null | wc -l)"
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    mtime="${entry%%.*}"                             # %T@ is epoch.fraction
+    f="${entry#* }"
+    total=$((total + 1))
+    age=$(( (now - mtime) / 86400 ))
 
-  while IFS= read -r f; do
-    [[ -n "$f" ]] || continue
-    if [[ "$ALWAYS_KEEP_NEWEST" == "1" && "$f" == "$keep" ]]; then
-      cont "keeping $(basename "$f")  [newest, older than ${days}d]"
-      continue
+    if (( age > days )); then
+      if [[ "$ALWAYS_KEEP_NEWEST" == "1" && "$f" == "$keep" ]]; then
+        cont "keeping $(basename "$f")  [newest, older than ${days}d]"
+        kept=$((kept + 1))
+        continue
+      fi
+      delete_file "$f" "older than ${days}d"
+      removed=$((removed + 1))
+    else
+      [[ "$LOG_KEPT" == "1" ]] && cont "keeping $(basename "$f")  [${age}d old, within ${days}d]"
+      kept=$((kept + 1))
     fi
-    delete_file "$f" "older than ${days}d"
-    removed=$((removed + 1))
   done < <(find "$dir" -maxdepth 1 -type f -name "$ARCHIVE_GLOB" \
-             -mtime "+${days}" 2>/dev/null | sort || true)
+             -printf '%T@ %p\n' 2>/dev/null | sort -rn || true)
 
-  KEPT=$(( KEPT + total - removed ))
-  val "$CURRENT" "total ${total}, removing ${removed}, keeping $(( total - removed ))"
+  KEPT=$(( KEPT + kept ))
+  val "$CURRENT" "total ${total}, removing ${removed}, keeping ${kept}"
 }
 
-# smart — full daily coverage for SMART_DAILY_DAYS, then one archive per ISO
-# week for SMART_WEEKLY_KEEP weeks. Newest first, so the archive kept for a week
-# is that week's most recent. ISO weeks (%G-W%V), so a run early on a Monday
-# does not merge two calendar weeks into one slot.
+# smart — full daily coverage for SMART_DAILY_DAYS, then the last SMART_WEEKDAY_KEEP
+# archives written on a Sunday. Newest first, so a Sunday with more than one
+# archive keeps its most recent. A Sunday with no archive is never seen, so it
+# costs nothing: the budget counts Sunday archives kept, not weeks walked back.
+# %u is 1..7 with Sunday as 7. The Sunday's own date is the slot key, so a
+# rerun on the same Sunday cannot claim a second slot.
 apply_smart() {
   local dir="$1" keep="$2"
-  local now cutoff f mtime label entry
+  local now cutoff f mtime dow label entry days_kept=0
   now="$(date +%s)"
   cutoff=$(( now - SMART_DAILY_DAYS * 86400 ))
 
@@ -861,8 +927,8 @@ apply_smart() {
   fi
 
   local -A keep_reason=()
-  local -A week_taken=()
-  local weekly=0
+  local -A day_taken=()
+  local days_kept=0
 
   for entry in "${sorted[@]}"; do
     mtime="${entry%%.*}"                             # %T@ is epoch.fraction
@@ -872,11 +938,14 @@ apply_smart() {
       keep_reason["$f"]="within ${SMART_DAILY_DAYS}d"
       continue
     fi
-    label="$(date -d "@$mtime" +'%G-W%V' 2>/dev/null || date -d "@$mtime" +'%Y-W%U')"
-    if [[ -z "${week_taken[$label]:-}" && $weekly -lt $SMART_WEEKLY_KEEP ]]; then
-      keep_reason["$f"]="weekly keeper $label"
-      week_taken["$label"]=1
-      weekly=$((weekly + 1))
+    [[ $days_kept -lt $SMART_WEEKDAY_KEEP ]] || continue
+    dow="$(date -d "@$mtime" +%u 2>/dev/null || echo 0)"
+    [[ "$dow" == "$SMART_WEEKDAY" ]] || continue
+    label="$(date -d "@$mtime" +%F 2>/dev/null || echo "")"
+    if [[ -n "$label" && -z "${day_taken[$label]:-}" ]]; then
+      keep_reason["$f"]="$(weekday_name "$SMART_WEEKDAY") $label"
+      day_taken["$label"]=1
+      days_kept=$((days_kept + 1))
     fi
   done
 
@@ -884,6 +953,7 @@ apply_smart() {
   for entry in "${sorted[@]}"; do
     f="${entry#* }"
     if [[ -n "${keep_reason[$f]:-}" ]]; then
+      [[ "$LOG_KEPT" == "1" ]] && cont "keeping $(basename "$f")  [${keep_reason[$f]}]"
       kept=$((kept + 1))
       continue
     fi
@@ -956,7 +1026,7 @@ phase physical 2/3
 # pass will not delete: it is that server's only physical restore path.
 apply_physical() {
   local tree="$1" pattern="$2" keep="$3"
-  local now cutoff entry mtime id label kept=0 removed=0 weekly=0
+  local now cutoff entry mtime id dow label kept=0 removed=0 days_kept=0
   local -a sorted=()
   mapfile -t sorted < <(find "$tree" -maxdepth 1 -type f -name "$PHYSICAL_GLOB" \
                           -printf '%T@ %f\n' 2>/dev/null | sort -rn || true)
@@ -968,7 +1038,7 @@ apply_physical() {
 
   now="$(date +%s)"
   local -A keep_reason=()
-  local -A week_taken=()
+  local -A day_taken=()
 
   for entry in "${sorted[@]}"; do
     mtime="${entry%%.*}"                             # %T@ is epoch.fraction
@@ -985,17 +1055,21 @@ apply_physical() {
       keep_reason["$id"]="within ${SMART_DAILY_DAYS}d"
       continue
     fi
-    label="$(date -d "@$mtime" +'%G-W%V' 2>/dev/null || date -d "@$mtime" +'%Y-W%U')"
-    if [[ -z "${week_taken[$label]:-}" && $weekly -lt $SMART_WEEKLY_KEEP ]]; then
-      keep_reason["$id"]="weekly keeper $label"
-      week_taken["$label"]=1
-      weekly=$((weekly + 1))
+    [[ $days_kept -lt $SMART_WEEKDAY_KEEP ]] || continue
+    dow="$(date -d "@$mtime" +%u 2>/dev/null || echo 0)"
+    [[ "$dow" == "$SMART_WEEKDAY" ]] || continue
+    label="$(date -d "@$mtime" +%F 2>/dev/null || echo "")"
+    if [[ -n "$label" && -z "${day_taken[$label]:-}" ]]; then
+      keep_reason["$id"]="$(weekday_name "$SMART_WEEKDAY") $label"
+      day_taken["$label"]=1
+      days_kept=$((days_kept + 1))
     fi
   done
 
   for entry in "${sorted[@]}"; do
     id="${entry#* }"; id="${id%.xbstream}"
     if [[ -n "${keep_reason[$id]:-}" ]]; then
+      [[ "$LOG_KEPT" == "1" ]] && cont "keeping set $id  [${keep_reason[$id]}]"
       kept=$((kept + 1))
       continue
     fi

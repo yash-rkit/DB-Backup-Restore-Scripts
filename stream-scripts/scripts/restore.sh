@@ -41,6 +41,7 @@ MYSQL_USER="__SET_ME__"                              # probes and post-restore c
 MYSQL_PASSWORD="__SET_ME__"
 SECONDARY_STORAGE_DIR="__SET_ME__"                   # which server to restore FROM — its backup.sh dir
 SMB_MOUNT_POINT="__SET_ME__"                         # the mount point itself, e.g. /livestorage
+EXTRA_MOUNTS=""                                      # other mounts that may hold server paths, space separated
 
 # ── 1B  TUNING ─────────────────────────────────────────────────────────────
 CONFIRM_WIPE=1                                       # 0 = refuse to run at all
@@ -81,6 +82,13 @@ XBSTREAM_BIN="${XBSTREAM_BIN:-}"                     # PATH
 MYSQL_BIN="${MYSQL_BIN:-}"                           # PATH
 MYSQLADMIN_BIN="${MYSQLADMIN_BIN:-}"                 # PATH
 MYSQLBINLOG_BIN="${MYSQLBINLOG_BIN:-}"               # PATH
+
+# A servers.json entry may carry mysql_user / mysql_password for a server whose
+# credentials differ from this host's. final.sh exports them for the one child
+# it is running; unset, both fall through to the 1A values above. Environment
+# rather than an argument, so the password never reaches anyone's ps output.
+MYSQL_USER="${DBVAULT_MYSQL_USER:-$MYSQL_USER}"
+MYSQL_PASSWORD="${DBVAULT_MYSQL_PASSWORD:-$MYSQL_PASSWORD}"
 
 # ── 1E  GUARD ──────────────────────────────────────────────────────────────
 # Refuses to start while any 1A value is still __SET_ME__.
@@ -375,6 +383,18 @@ trap 'INTERRUPTED=1; fail_run' INT TERM
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 4  PROBES
 # ═══════════════════════════════════════════════════════════════════════════
+
+# The mount a configured path sits under — SMB_MOUNT_POINT, or one of
+# EXTRA_MOUNTS when the backups are spread over more than one filer. Empty
+# means the path is on none of them: an ordinary local directory that would
+# accept writes and deletes on the root filesystem.
+mount_for() {
+  local p="$1" m
+  for m in $SMB_MOUNT_POINT $EXTRA_MOUNTS; do
+    [[ "$p" == "$m"/* ]] && { printf '%s' "$m"; return 0; }
+  done
+  return 1
+}
 
 free_gb()  { df -BG "$1" | awk 'NR==2 {print $4}' | sed 's/G//'; }
 # `-p"$MYSQL_PASSWORD"` collapses to a bare `-p` when the password is empty,
@@ -756,13 +776,16 @@ ok "smb share"
 # found' rather than 'wrong path'. mountpoint is only ever true for the mount
 # point itself, never a subdirectory, so the check has to be a prefix test.
 check
-[[ "$SECONDARY_STORAGE_DIR" == "$SMB_MOUNT_POINT"/* ]] \
+BASE_MOUNT="$(mount_for "$SECONDARY_STORAGE_DIR")" \
   || die "$(leader 'backup base' 'OFF THE SHARE')" \
          "SECONDARY_STORAGE_DIR is $SECONDARY_STORAGE_DIR" \
-         "which is not under the mount point $SMB_MOUNT_POINT" \
+         "which is under neither $SMB_MOUNT_POINT nor EXTRA_MOUNTS (${EXTRA_MOUNTS:-none})" \
          "reading from local disk here would restore whatever happens to be" \
          "at that path, or find nothing and look like a missing backup"
-val "backup base" "under $SMB_MOUNT_POINT"
+mountpoint -q "$BASE_MOUNT" \
+  || die "$(leader 'backup base' 'NOT MOUNTED')" \
+         "$BASE_MOUNT holds SECONDARY_STORAGE_DIR but is not a mount point"
+val "backup base" "under $BASE_MOUNT"
 
 check
 ARCHIVE_SIZE="n/a"
