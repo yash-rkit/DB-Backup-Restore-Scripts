@@ -47,6 +47,7 @@ KEEP_LOCAL_DAYS=14                                   # prune logs stranded by a 
 PARALLEL_THREADS=""                                  # read threads;  blank = half the cores
 COMPRESS_THREADS=""                                  # zstd threads;  blank = half the cores
 ZSTD_LEVEL=1                                         # the link is the bottleneck, not the CPU
+MIN_TRANSFER_MIBPS=0                                 # warn under this share speed; 0 = measure only
 
 BINLOG_SCRIPT=""                                     # collector to run inline (PART 14); empty = don't
 
@@ -142,14 +143,38 @@ phase() { PHASE="$1"; STEP="${2:--}"; PHASE_EPOCH="$(date +%s)"; }
 check() { PHASE="preflight"; CHECK_N=$((CHECK_N + 1))
           STEP="$(printf '%02d/%02d' "$CHECK_N" "$CHECK_TOTAL")"; }
 
-elapsed() {
-  local d=$(( $(date +%s) - $1 ))
+# Seconds as 45s or 3m07s.
+fmt_dur() {
+  local d="${1:-0}"
   if (( d < 60 )); then printf '%ds' "$d"; else printf '%dm%02ds' $((d / 60)) $((d % 60)); fi
 }
+
+elapsed() { fmt_dur $(( $(date +%s) - $1 )); }
+
+# Seconds since an epoch stamp — elapsed() prints, this one is for arithmetic.
+secs_since() { printf '%d' $(( $(date +%s) - ${1:-0} )); }
 
 hsize() {
   numfmt --to=iec-i --suffix=B "$1" 2>/dev/null \
     || awk -v b="$1" 'BEGIN { printf "%.1fGiB", b/1073741824 }'
+}
+
+# MiB/s as a bare number — for comparing, and for the manifest.
+mibps() {
+  awk -v b="${1:-0}" -v s="${2:-0}" 'BEGIN { if (s < 1) s = 1; printf "%.1f", b / 1048576 / s }'
+}
+
+# MiB/s for the file, Mbit/s for the link it crossed.
+rate() {
+  awk -v b="${1:-0}" -v s="${2:-0}" 'BEGIN {
+    if (s < 1) s = 1
+    printf "%.1f MiB/s (%.0f Mbit/s)", b / 1048576 / s, b * 8 / 1000000 / s
+  }'
+}
+
+# True when $1 MiB/s is under the floor $2. Floats, so awk and not (( )).
+under_floor() {
+  awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN { exit !(b > 0 && a < b) }'
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -403,6 +428,10 @@ if [[ "$SECONDARY_STORAGE_DIR" == "$BACKUP_BASE"* ]]; then
   echo "[ERROR] SECONDARY_STORAGE_DIR is inside BACKUP_BASE — scratch is wiped each run." >&2
   exit 1
 fi
+if ! [[ "$MIN_TRANSFER_MIBPS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "[ERROR] MIN_TRANSFER_MIBPS must be a number, got '$MIN_TRANSFER_MIBPS' (0 = measure only)." >&2
+  exit 1
+fi
 for dir in "$BACKUP_BASE" "$XB_TMPDIR" "$LSN_DIR" "$LOCK_DIR"; do
   if [[ ! -d "$dir" ]] && ! mkdir -p "$dir" 2>/dev/null; then
     echo "[ERROR] Failed to create directory: $dir" >&2
@@ -411,6 +440,12 @@ for dir in "$BACKUP_BASE" "$XB_TMPDIR" "$LSN_DIR" "$LOCK_DIR"; do
 done
 
 printf 'errors for backup run %s (started %s)\n\n' "$BACKUP_ID" "$(date '+%F %T')" > "$ERROR_LOG"
+
+if [[ "$MIN_TRANSFER_MIBPS" == "0" ]]; then
+  SPEED_FLOOR_NOTE="none — measure and report only"
+else
+  SPEED_FLOOR_NOTE="warn under ${MIN_TRANSFER_MIBPS} MiB/s"
+fi
 
 banner " BACKUP RUN $BACKUP_ID"
 kv "started"     "$(date '+%F %T %Z')"
@@ -421,6 +456,7 @@ kv "destination" "$SECONDARY_STORAGE_DIR"
 kv "staging"     "$BACKUP_BASE"
 kv "compression" "zstd level $ZSTD_LEVEL"
 kv "threads"     "$PARALLEL_THREADS read / $COMPRESS_THREADS compress"
+kv "speed floor" "$SPEED_FLOOR_NOTE"
 kv "prepare"     "NOT done here — restore.sh runs --prepare"
 sub
 
@@ -632,7 +668,11 @@ if [[ $XB_STATUS -ne 0 ]]; then
 fi
 
 STREAM_BYTES=$(stat -c%s "$STREAM_FILE")
+STREAM_SECS=$(secs_since "$PHASE_EPOCH")             # dump wall time
 info "done  $(hsize "$STREAM_BYTES")  ($(elapsed "$PHASE_EPOCH"))"
+val "datadir read"  "$(rate "$DATADIR_BYTES" "$STREAM_SECS")"
+val "archive write" "$(rate "$STREAM_BYTES" "$STREAM_SECS")"
+cont "local disk and CPU only — nothing has crossed the link yet"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 9  VERIFY  2/5
@@ -713,14 +753,19 @@ fi
 
 phase sha256 4/5
 
+HASH_EPOCH=$(date +%s)                               # times the first read only
 sha256sum "$STREAM_FILE" > "$CHECKSUM_FILE" 2>>"$ERROR_LOG" \
   || die "failed to generate the SHA-256 checksum"
+LOCAL_HASH_SECS=$(secs_since "$HASH_EPOCH")          # local read + hash wall time
+LOCAL_HASH_MIBPS=$(mibps "$STREAM_BYTES" "$LOCAL_HASH_SECS")
 [[ -s "$CHECKSUM_FILE" ]] || die "the checksum file is empty"
 BACKUP_SHA256=$(awk '{print $1}' "$CHECKSUM_FILE")
 
 sha256sum -c "$CHECKSUM_FILE" >/dev/null 2>>"$ERROR_LOG" \
   || die "SHA-256 verification failed on local staging — the stream is corrupt"
 val "sha256" "$BACKUP_SHA256"
+val "local hash rate" "$(rate "$STREAM_BYTES" "$LOCAL_HASH_SECS")  in $(fmt_dur "$LOCAL_HASH_SECS")"
+cont "baseline: same file, same CPU, local disk — the share is judged against this"
 
 COMPRESSION_PCT=$(awk -v s="$STREAM_BYTES" -v d="$DATADIR_BYTES" \
   'BEGIN { if (d > 0) printf "%.1f", (s * 100) / d; else printf "n/a" }')
@@ -742,12 +787,19 @@ SECONDARY_FILE="${SECONDARY_STORAGE_DIR}/${BACKUP_ID}.xbstream"
 [[ ! -e "$SECONDARY_FILE" ]] || die "destination already exists: $SECONDARY_FILE"
 
 info "copying $(hsize "$STREAM_BYTES") to the share"
+UPLOAD_EPOCH=$(date +%s)                             # the write leg: cp plus the flush
 cp "$STREAM_FILE" "${SECONDARY_FILE}.part" 2>>"$ERROR_LOG" \
   || die "failed to copy the archive to $SECONDARY_STORAGE_DIR"
 
 sync "${SECONDARY_FILE}.part" 2>/dev/null || sync || true
+UPLOAD_SECS=$(secs_since "$UPLOAD_EPOCH")            # write wall time
+UPLOAD_MIBPS=$(mibps "$STREAM_BYTES" "$UPLOAD_SECS")
+val "upload rate" "$(rate "$STREAM_BYTES" "$UPLOAD_SECS")  in $(fmt_dur "$UPLOAD_SECS")"
 
+READBACK_EPOCH=$(date +%s)                           # the read leg: the same bytes back
 TRANSFERRED_SHA=$(sha256sum "${SECONDARY_FILE}.part" 2>>"$ERROR_LOG" | awk '{print $1}')
+READBACK_SECS=$(secs_since "$READBACK_EPOCH")        # read wall time
+READBACK_MIBPS=$(mibps "$STREAM_BYTES" "$READBACK_SECS")
 [[ "$TRANSFERRED_SHA" == "$BACKUP_SHA256" ]] \
   || die "$(leader 'archive on share' 'CHECKSUM MISMATCH')" \
          "expected $BACKUP_SHA256" \
@@ -757,6 +809,7 @@ mv "${SECONDARY_FILE}.part" "$SECONDARY_FILE" 2>>"$ERROR_LOG" \
   || die "failed to finalize the archive name on the share"
 TRANSFER_OK="yes"
 ok "archive verified on share"
+val "read-back rate" "$(rate "$STREAM_BYTES" "$READBACK_SECS")  in $(fmt_dur "$READBACK_SECS")"
 info "transferred in $(elapsed "$PHASE_EPOCH")"
 
 rm -f "$STREAM_FILE" 2>>"$ERROR_LOG" || warn "could not remove scratch archive"
@@ -804,6 +857,12 @@ backup_type=${BACKUP_TYPE}
 from_lsn=${FROM_LSN}
 to_lsn=${TO_LSN}
 datadir_bytes=${DATADIR_BYTES}
+dump_secs=${STREAM_SECS}
+local_hash_mibps=${LOCAL_HASH_MIBPS}
+upload_secs=${UPLOAD_SECS}
+upload_mibps=${UPLOAD_MIBPS}
+readback_secs=${READBACK_SECS}
+readback_mibps=${READBACK_MIBPS}
 mysql_version=$(mysql_q "SELECT VERSION()" || echo unknown)
 xtrabackup_version=${XB_BANNER}
 binlog_format=$(mysql_q "SELECT @@binlog_format" || echo unknown)
@@ -825,9 +884,31 @@ for f in "$SECONDARY_FILE" "$CHECKSUM_FILE" "$BINLOG_INFO_FILE" "$MANIFEST_FILE"
 done
 
 info "re-reading the archive from the share for a final integrity check"
+FINAL_EPOCH=$(date +%s)                              # the second read of the same bytes
 sha256sum -c "$CHECKSUM_FILE" >/dev/null 2>>"$ERROR_LOG" \
   || die "final SHA-256 verification FAILED against the published archive"
+FINAL_SECS=$(secs_since "$FINAL_EPOCH")              # second-read wall time
+FINAL_MIBPS=$(mibps "$STREAM_BYTES" "$FINAL_SECS")
 ok "final integrity check"
+val "final read rate" "$(rate "$STREAM_BYTES" "$FINAL_SECS")  in $(fmt_dur "$FINAL_SECS")"
+
+SHARE_SECS=$(( UPLOAD_SECS + READBACK_SECS + FINAL_SECS ))   # every second spent on the share
+SHARE_BYTES=$(( STREAM_BYTES * 3 ))                          # written once, read back twice
+SHARE_MIBPS=$(mibps "$SHARE_BYTES" "$SHARE_SECS")
+val "share total" "$(fmt_dur "$SHARE_SECS") for $(hsize "$SHARE_BYTES")  $(rate "$SHARE_BYTES" "$SHARE_SECS")"
+cont "the archive crosses the link three times: one write, two reads"
+
+SLOW_LEGS=""
+for leg in "upload:$UPLOAD_MIBPS" "read-back:$READBACK_MIBPS" "final read:$FINAL_MIBPS"; do
+  if under_floor "${leg##*:}" "$MIN_TRANSFER_MIBPS"; then
+    SLOW_LEGS="${SLOW_LEGS:+$SLOW_LEGS, }${leg%%:*} ${leg##*:}"
+  fi
+done
+if [[ -n "$SLOW_LEGS" ]]; then
+  nok "share throughput" "BELOW ${MIN_TRANSFER_MIBPS} MiB/s"
+  cont "$SLOW_LEGS"
+  cont "local disk did ${LOCAL_HASH_MIBPS} MiB/s on this same file — the gap is the link"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PART 13  SUMMARY
@@ -840,6 +921,14 @@ banner " BACKUP OK  $BACKUP_ID"
 kv "duration"        "$(elapsed "$START_EPOCH")"
 kv "datadir size"    "$(hsize "$DATADIR_BYTES")"
 kv "archive size"    "$(hsize "$STREAM_BYTES")  (${COMPRESSION_PCT}% of datadir)"
+sub
+kv "dump"            "$(fmt_dur "$STREAM_SECS")   $(rate "$DATADIR_BYTES" "$STREAM_SECS") off the datadir"
+kv "local baseline"  "$(fmt_dur "$LOCAL_HASH_SECS")   $(rate "$STREAM_BYTES" "$LOCAL_HASH_SECS") hashing local staging"
+kv "upload"          "$(fmt_dur "$UPLOAD_SECS")   $(rate "$STREAM_BYTES" "$UPLOAD_SECS") to the share"
+kv "read-back"       "$(fmt_dur "$READBACK_SECS")   $(rate "$STREAM_BYTES" "$READBACK_SECS") from the share"
+kv "final read"      "$(fmt_dur "$FINAL_SECS")   $(rate "$STREAM_BYTES" "$FINAL_SECS") from the share"
+kv "share total"     "$(fmt_dur "$SHARE_SECS")   ${SHARE_MIBPS} MiB/s over $(hsize "$SHARE_BYTES")"
+sub
 kv "archive"         "$SECONDARY_FILE"
 kv "sha256"          "$BACKUP_SHA256"
 kv "binlog position" "${BINLOG_NAME}:${BINLOG_POS}"
@@ -873,7 +962,7 @@ else
 fi
 
 PHASE="done"; STEP="-"
-banner " RESULT ok id=${BACKUP_ID} dur_s=$(( $(date +%s) - START_EPOCH )) bytes=${STREAM_BYTES} warn=${WARN_COUNT}"
+banner " RESULT ok id=${BACKUP_ID} dur_s=$(( $(date +%s) - START_EPOCH )) bytes=${STREAM_BYTES} up_mibps=${UPLOAD_MIBPS} down_mibps=${READBACK_MIBPS} share_s=${SHARE_SECS} warn=${WARN_COUNT}"
 
 publish_logs
 

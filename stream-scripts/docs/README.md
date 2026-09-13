@@ -225,6 +225,12 @@ backup_type=full-backuped
 from_lsn=0
 to_lsn=21474836480
 datadir_bytes=443012234752       ← restore.sh sizes its space check off this
+dump_secs=1500                   ← the five throughput fields below are diagnostic only
+local_hash_mibps=1280.0
+upload_secs=3600
+upload_mibps=85.3
+readback_secs=3540
+readback_mibps=86.8
 mysql_version=8.0.35
 xtrabackup_version=xtrabackup version 8.0.35-30 based on …
 binlog_format=ROW
@@ -238,6 +244,13 @@ datadir=/Data/mysql
 `datadir_bytes` is the measured size of the source datadir. It is the difference
 between the restore knowing how much space it needs and guessing a multiple of
 the compressed archive — see [§10](#10-disk-space).
+
+The throughput fields are recorded, never read back. Nothing branches on them;
+they are there so that `grep upload_mibps= /livestorage/*/*.manifest` gives the
+link's history across every run, which is the only way to tell a link that has
+always been slow from one that degraded last Tuesday. `local_hash_mibps` is the
+same archive read off local disk, so the pair is a like-for-like comparison of
+the box against the link — see [§12](#is-it-the-link-or-the-box).
 
 ---
 
@@ -270,6 +283,7 @@ HH:MM:SS LEVEL [phase     nn/nn] message
  staging         : /Data/dbvault-stage
  compression     : zstd level 1
  threads         : 8 read / 8 compress
+ speed floor     : none — measure and report only
  prepare         : NOT done here — restore.sh runs --prepare
 --------------------------------------------------------------
 14:30:05 INFO  [preflight 01/15] user privileges ....................... OK
@@ -294,6 +308,9 @@ HH:MM:SS LEVEL [phase     nn/nn] message
 14:30:31 INFO  [stream 1/5]      starting xtrabackup, progress in 20260820_xtrabackup.log
 14:30:31 INFO  [stream 1/5]      lock held for binlog_collect.sh: /var/lock/dbvault/dbvault-stage_20260820_lock (pid 21877)
 14:53:56 INFO  [stream 1/5]      done  138.4GiB  (23m25s)
+14:53:56 INFO  [stream 1/5]      datadir read ... 300.7 MiB/s (2522 Mbit/s)
+14:53:56 INFO  [stream 1/5]      archive write ... 100.9 MiB/s (846 Mbit/s)
+                                 local disk and CPU only — nothing has crossed the link yet
 14:53:56 INFO  [verify 2/5]      completed OK! x1 ...................... OK
 14:53:56 INFO  [verify 2/5]      stream non-empty ..................... OK
 14:53:56 INFO  [verify 2/5]      extra-lsndir metadata ................ OK
@@ -302,22 +319,38 @@ HH:MM:SS LEVEL [phase     nn/nn] message
 14:53:56 INFO  [binlog 3/5]      binlog position ........ binlog.000018:157
                                  source: xtrabackup log
 14:55:24 INFO  [sha256 4/5]      sha256 ... a3f9c1e04b7d…
+14:55:24 INFO  [sha256 4/5]      local hash rate ... 1610.6 MiB/s (13510 Mbit/s)  in 1m28s
+                                 baseline: same file, same CPU, local disk — the share is judged against this
 14:55:24 INFO  [sha256 4/5]      verified locally  138.4GiB = 33.5% of datadir  (1m28s)
-15:32:44 INFO  [publish 5/5]     copying 138.4GiB to the share
-15:32:44 INFO  [publish 5/5]     archive verified on share ............ OK
-15:32:44 INFO  [publish 5/5]     transferred in 37m20s
-15:32:45 INFO  [publish 5/5]     checksum published ................... OK
-15:32:45 INFO  [publish 5/5]     binlog anchor published .............. OK
-15:32:45 INFO  [publish 5/5]     metadata published ................... OK
-15:32:46 INFO  [publish 5/5]     manifest published ................... OK
-15:32:46 INFO  [publish 5/5]     final integrity check ................ OK
+14:55:24 INFO  [publish 5/5]     copying 138.4GiB to the share
+15:32:44 INFO  [publish 5/5]     upload rate ... 63.3 MiB/s (531 Mbit/s)  in 37m20s
+16:07:54 INFO  [publish 5/5]     archive verified on share ............ OK
+16:07:54 INFO  [publish 5/5]     read-back rate ... 67.2 MiB/s (563 Mbit/s)  in 35m10s
+16:07:54 INFO  [publish 5/5]     transferred in 72m30s
+16:07:55 INFO  [publish 5/5]     checksum published ................... OK
+16:07:55 INFO  [publish 5/5]     binlog anchor published .............. OK
+16:07:55 INFO  [publish 5/5]     metadata published ................... OK
+16:07:56 INFO  [publish 5/5]     manifest published ................... OK
+16:07:56 INFO  [publish 5/5]     re-reading the archive from the share for a final integrity check
+16:42:16 INFO  [publish 5/5]     final integrity check ................ OK
+16:42:16 INFO  [publish 5/5]     final read rate ... 68.8 MiB/s (576 Mbit/s)  in 34m20s
+16:42:16 INFO  [publish 5/5]     share total ... 106m50s for 415.2GiB  66.3 MiB/s (556 Mbit/s)
+                                 the archive crosses the link three times: one write, two reads
 
 ==============================================================
  BACKUP OK  20260820
 ==============================================================
- duration        : 62m41s
+ duration        : 132m11s
  datadir size    : 412.6GiB
  archive size    : 138.4GiB  (33.5% of datadir)
+--------------------------------------------------------------
+ dump            : 23m25s   300.7 MiB/s (2522 Mbit/s) off the datadir
+ local baseline  : 1m28s   1610.6 MiB/s (13510 Mbit/s) hashing local staging
+ upload          : 37m20s   63.3 MiB/s (531 Mbit/s) to the share
+ read-back       : 35m10s   67.2 MiB/s (563 Mbit/s) from the share
+ final read      : 34m20s   68.8 MiB/s (576 Mbit/s) from the share
+ share total     : 106m50s   66.3 MiB/s over 415.2GiB
+--------------------------------------------------------------
  archive         : /livestorage/YK/Restore-VM/20260820.xbstream
  sha256          : a3f9c1e04b7d…
  binlog position : binlog.000018:157
@@ -332,9 +365,9 @@ HH:MM:SS LEVEL [phase     nn/nn] message
 --------------------------------------------------------------
  logs            : /livestorage/YK/Restore-VM/logs/20260820/
 --------------------------------------------------------------
-15:32:47 INFO  [collect -]       inline collection .................... OK
+16:42:17 INFO  [collect -]       inline collection .................... OK
 ==============================================================
- RESULT ok id=20260820 dur_s=3761 bytes=148615495680 warn=1
+ RESULT ok id=20260820 dur_s=7932 bytes=148615495680 up_mibps=63.3 down_mibps=67.2 share_s=6410 warn=1
 ==============================================================
 ```
 
@@ -393,13 +426,18 @@ last check does not read `15/15`.
 Every run ends with exactly one greppable line:
 
 ```
- RESULT ok     id=20260820 dur_s=3761 bytes=148615495680 warn=1
+ RESULT ok     id=20260820 dur_s=7932 bytes=148615495680 up_mibps=63.3 down_mibps=67.2 share_s=6410 warn=1
  RESULT failed id=20260820 phase=stream step=1/5 dur_s=1405 warn=0
 ```
 
 ```bash
 grep '^ RESULT' /livestorage/YK/Restore-VM/logs/*/backup.log
 ```
+
+`up_mibps`, `down_mibps` and `share_s` appear on the `ok` line only — a failed
+run has no complete transfer to measure. They are there so that one `grep` over
+every log on the share plots the link's speed over time without opening a single
+manifest.
 
 `binlog_collect.sh` emits the same shape with its own fields:
 
@@ -567,7 +605,12 @@ reasoning lives here instead.
 | `is_binlog <name>` | matches `<prefix>.NNNNNN` only |
 | `seq_of <name>` | binlog sequence as a decimal integer |
 | `hsize <bytes>` | `138.4GiB` |
-| `elapsed <epoch>` | `45s` or `23m25s` |
+| `fmt_dur <seconds>` | `45s` or `23m25s` |
+| `elapsed <epoch>` | `fmt_dur` of now minus the stamp |
+| `secs_since <epoch>` | the same subtraction, unformatted, for arithmetic |
+| `mibps <bytes> <seconds>` | `63.3` — a bare number, for comparing and for the manifest |
+| `rate <bytes> <seconds>` | `63.3 MiB/s (531 Mbit/s)` — both units, for the log |
+| `under_floor <mibps> <floor>` | true when the rate is below the floor; a floor of `0` is always false |
 
 Two of these encode CIFS lessons:
 
@@ -796,6 +839,19 @@ xtrabackup log are echoed into the run log as continuation lines and the whole
 file is appended to `errors.log`, so the cause is in the published logs without
 needing the scratch directory.
 
+Two rates are reported when it finishes:
+
+```
+INFO  [stream 1/5]     datadir read ..... 614.4 MiB/s (5154 Mbit/s)
+INFO  [stream 1/5]     archive write .... 204.8 MiB/s (1718 Mbit/s)
+```
+
+`datadir read` is `DATADIR_BYTES / seconds` — how fast the datadir came off the
+source disk. `archive write` is `STREAM_BYTES / seconds` — how fast the
+compressed result landed on staging. Both are local: this phase never touches
+the share, so a slow number here is the disk, the CPU or a busy mysqld, and
+nothing to do with the network.
+
 ### PART 9 — verify, 2/5
 
 ```bash
@@ -826,6 +882,13 @@ limitation visible at restore time.
 Generated and verified **locally**, before the transfer. This catches a stream
 corrupted on the way to local disk, separately from the post-transfer check.
 
+The generating pass is timed and reported as `local hash rate`. That number is
+the **baseline**: the same file, the same CPU, the same sha256sum, read off
+local disk instead of the share. Every share rate in PART 12 is judged against
+it. Only the first pass is timed — the `sha256sum -c` immediately after reads
+the same bytes a second time, usually out of page cache, and would flatter the
+number.
+
 ### PART 12 — publish, 5/5
 
 Order matters throughout:
@@ -847,6 +910,50 @@ Order matters throughout:
 
 Step 8 is not redundant with step 3: step 3 verifies what was just written, step 8
 verifies what a restore will actually read back later.
+
+#### Where the time goes
+
+The archive crosses the link **three times**: written once in step 2, read back
+in step 3, read back again in step 8. Each crossing is timed separately, because
+a link that writes fast and reads slow is a different fault from one that is
+slow both ways:
+
+```
+INFO  [publish 5/5]    upload rate ...... 85.3 MiB/s (716 Mbit/s)  in 60m00s
+INFO  [publish 5/5]    read-back rate ... 86.8 MiB/s (728 Mbit/s)  in 59m00s
+INFO  [publish 5/5]    final read rate .. 88.3 MiB/s (741 Mbit/s)  in 58m00s
+INFO  [publish 5/5]    share total ...... 177m00s for 900GiB  86.8 MiB/s (728 Mbit/s)
+```
+
+Both units are printed for a reason. MiB/s is the file — divide the archive size
+by it and you have the wall time. Mbit/s is the link — it is the unit the
+provider sells, the NIC reports and the firewall rate-limits in, so it is the
+number to quote when the answer is "the pipe is the problem".
+
+`share total` is the sum of all three legs over three times the archive size. If
+that figure is most of the run's duration, the link is the run, and nothing that
+can be tuned on the box will change it.
+
+#### The floor
+
+`MIN_TRANSFER_MIBPS` sets a floor. At its default of `0` the rates are measured
+and printed and nothing else happens. Set it, and any leg below it raises one
+warning naming the legs that fell short:
+
+```
+WARN  [publish 5/5]    share throughput ......... BELOW 100 MiB/s
+                       upload 85.3, read-back 86.8, final read 88.3
+                       local disk did 1280.0 MiB/s on this same file — the gap is the link
+```
+
+It is a warning, never a failure. A backup that arrived slowly is still a
+backup, and failing the run would destroy a verified archive over a performance
+complaint. The warning counts toward `warn=` on the RESULT line, so a monitor
+watching that field sees it.
+
+Pick the floor from a known-good run rather than from the link's rated speed:
+CIFS over a WAN rarely reaches half of what the pipe is sold as, and a floor set
+to the brochure figure warns on every run and is then ignored.
 
 ### PART 14 — inline collection
 
@@ -1159,6 +1266,7 @@ empty chain rather than an error.
 | `PARALLEL_THREADS` | `backup.sh` | blank | xtrabackup read threads. Blank = half the cores of whatever host it lands on; fill in a number to pin it |
 | `COMPRESS_THREADS` | `backup.sh` | blank | zstd threads, same rule. Half plus half is about one core count, which leaves the box able to serve queries — check 13 warns if the pair exceeds twice the cores |
 | `ZSTD_LEVEL` | `backup.sh` | `1` | the link is the bottleneck, not the CPU |
+| `MIN_TRANSFER_MIBPS` | `backup.sh` | `0` | floor for the share legs, in MiB/s. `0` measures and reports without warning. Any other value warns — never fails — when upload, read-back or the final read falls below it. Set it from a known-good run, not from the link's rated speed |
 | `STREAM_SPACE_PCT` | `backup.sh` | `40` | staging requirement, % of the datadir |
 | `XB_TMPDIR` | `backup.sh` | `/Data/xb-tmp` | `--tmpdir`, and the parent of `--extra-lsndir` |
 | `BINLOG_SCRIPT` | `backup.sh` | empty | collector to run inline once the archive is published. Empty leaves it to its own cron entry |
@@ -1288,6 +1396,51 @@ tail -40 logs/20260820/collect/collect.log
 Reads the whole archive off the share, confirms the SHA-256, and decodes the
 binlogs that would be replayed. Nothing is modified.
 
+### Is it the link or the box?
+
+A run where the transfer takes an hour and the integrity check takes another is
+the normal shape of a VM in one cloud writing to an SMB share in another. The
+rates say whether that hour is the link or something fixable locally. Read
+them off the summary:
+
+```
+ dump            : 25m00s   614.4 MiB/s (5154 Mbit/s) off the datadir
+ local baseline  : 4m00s   1280.0 MiB/s (10737 Mbit/s) hashing local staging
+ upload          : 60m00s   85.3 MiB/s (716 Mbit/s) to the share
+ read-back       : 59m00s   86.8 MiB/s (728 Mbit/s) from the share
+ final read      : 58m00s   88.3 MiB/s (741 Mbit/s) from the share
+ share total     : 177m00s   86.8 MiB/s over 900GiB
+```
+
+| What the numbers show | What it means |
+| --- | --- |
+| local baseline high, all three share legs low and close together | the link. Nothing on the VM will fix it |
+| share legs at or near the local baseline | the link is not the constraint; look at the dump rate and the disk |
+| upload fast, reads slow | asymmetric path, or CIFS read-ahead. Try `rsize=`/`cache=` mount options before blaming the pipe |
+| local baseline itself low | the box is the constraint — CPU contention or a slow staging disk. The share numbers cannot exceed it |
+| dump rate low, share legs fine | mysqld contention or source-disk I/O, not the transfer at all |
+
+The one thing worth knowing before tuning anything: the archive crosses the link
+**three times** — one write and two reads. A 300 GiB archive on a link that
+sustains 85 MiB/s is about three hours of wire time no matter how the box is
+configured. Halving that means a faster link, a smaller archive (a higher
+`ZSTD_LEVEL` trades CPU for bytes, and the CPU is idle while the link works), or
+accepting one less verification pass.
+
+To confirm the link independently of MySQL, time a plain copy of a large file to
+the share and back:
+
+```bash
+dd if=/dev/urandom of=/Data/dbvault-stage/.probe bs=1M count=4096 status=none
+time cp /Data/dbvault-stage/.probe "$SECONDARY_STORAGE_DIR/.probe" ; sync
+time sha256sum "$SECONDARY_STORAGE_DIR/.probe"
+rm -f /Data/dbvault-stage/.probe "$SECONDARY_STORAGE_DIR/.probe"
+```
+
+4 GiB at the rates above is roughly 48 seconds each way. If the probe matches
+what the backup reported, the script is not the problem and the measurement is
+already correct.
+
 ### Test the prepare before you need it
 
 The one thing this chain asks that the tar chain did not. Because the prepare
@@ -1329,6 +1482,7 @@ Until step 5 completes, the server has no usable recovery baseline.
 | `archive name free … NO` | two runs started in the same second, or the share was unreachable when the name was chosen and that day is already taken |
 | `disk space … INSUFFICIENT` | see [§10](#10-disk-space); raise `STREAM_SPACE_PCT` |
 | `smb share … NOT WRITABLE` | stale handle or expired credentials. Remount |
+| `share throughput … BELOW n MiB/s` | the share legs ran under `MIN_TRANSFER_MIBPS`. The archive is fine; see [§12](#is-it-the-link-or-the-box) |
 | `start binlog … PURGED` | MySQL purged a binlog before collection. Raise `binlog_expire_logs_seconds` |
 | `SEQUENCE GAP` | same cause; that PITR range is permanently lost |
 | `Manifest says archive_format='tar.gz'` | a tar-chain archive. Use `server/physical/restore_full.sh` |
