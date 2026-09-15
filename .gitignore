@@ -1,11 +1,14 @@
 .DS_Store
-/logs
+
+# All run logs and benchmark output live here — never tracked.
+/logs/
+
+# Stray bench output if a harness is run from the repo root.
+/Cloud-Live-DB-*
+/*.log
 
 # age keys — private keys must never be committed
 key*.txt
 *-key.txt
 *.agekey
 recipients.txt
-Cloud-Live-DB-*
-tests/
-cleanup.log

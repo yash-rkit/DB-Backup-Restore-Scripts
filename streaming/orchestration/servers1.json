@@ -1,0 +1,54 @@
+[
+  {
+    "server_name": "Auth-DB",
+    "backup_base": "/livestorage/Backup/Auth-DB/percona",
+    "base_dir": "/livestorage/Backup/Auth-DB",
+    "sync_dest": "/southstorage/backup_latest/Auth-DB"
+  },
+  {
+    "server_name": "Cloud-Cen-DB",
+    "backup_base": "/livestorage/Backup/Cloud-Cen-DB/percona",
+    "base_dir": "/livestorage/Backup/Cloud-Cen-DB",
+    "sync_dest": "/southstorage/backup_latest/Cloud-Cen-DB"
+  },
+  {
+    "server_name": "Cloud-GPR-Cen-DB",
+    "backup_base": "/livestorage/Backup/Cloud-GPR-Cen-DB/percona",
+    "base_dir": "/livestorage/Backup/Cloud-GPR-Cen-DB",
+    "sync_dest": "/southstorage/backup_latest/Cloud-GPR-Cen-DB"
+  },
+  {
+    "server_name": "Auto-DB-Demo",
+    "backup_base": "/livestorage/Backup/Auto-DB-Demo/percona",
+    "base_dir": "/livestorage/Backup/Auto-DB-Demo",
+    "sync_dest": "/southstorage/backup_latest/Auto-DB-Demo",
+    "mysql_user": "Admin",
+    "mysql_password": ""
+  },
+  {
+    "server_name": "AUTODB-Live",
+    "backup_base": "/livestorage/Backup/AUTODB-Live/percona",
+    "base_dir": "/livestorage/Backup/AUTODB-Live",
+    "sync_dest": "/southstorage/backup_latest/AUTODB-Live",
+    "mysql_user": "Admin",
+    "mysql_password": ""
+  },
+  {
+    "server_name": "Autopublish-DB",
+    "backup_base": "/livestorage/Backup/Autopublish-DB/percona",
+    "base_dir": "/livestorage/Backup/Autopublish-DB",
+    "sync_dest": "/southstorage/backup_latest/Autopublish-DB"
+  },
+  {
+    "server_name": "GPR-Live-DB",
+    "backup_base": "/livestorage/Backup/GPR-Live-DB/percona",
+    "base_dir": "/livestorage/Backup/GPR-Live-DB",
+    "sync_dest": "/southstorage/backup_latest/GPR-Live-DB"
+  },
+  {
+    "server_name": "CEN-SERVER",
+    "backup_base": "/gplivebkp/CEN-SERVER/percona",
+    "base_dir": "/gplivebkp/CEN-SERVER",
+    "sync_dest": "/southstorage/backup_latest/CEN-SERVER"
+  }
+]
